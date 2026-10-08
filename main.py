@@ -18,7 +18,7 @@ NESTLINK_WEBHOOK_SECRET = os.getenv("NESTLINK_WEBHOOK_SECRET", "imhotep-nestlink
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 CORS_ORIGINS     = [o.strip() for o in os.getenv("CORS_ORIGINS","*").split(",") if o.strip()]
 
-app = FastAPI(title="Imhotep", version="2.9.0")
+app = FastAPI(title="Imhotep", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -44,17 +44,23 @@ PERSONAS = {
     "civic":"a civic analyst","marketer":"a marketer","media":"a media producer",
     "activist":"an activist","tongue-twister":"a playful tongue-twister agent",
 }
+
 def sys_prompt(a):
     p = PERSONAS.get(a, "a general assistant")
-    return (f"You are Imhotep, built by Samuel Kiragu in Kenya. "
-            f"You are the {a.upper()} agent — {p}.\n"
-            "1. Answer in 3-5 sentences MAX. Direct, sharp.\n"
-            "2. NEVER mention model/company names.\n"
-            "3. If asked: 'I run on Imhotep — built by Samuel Kiragu.'\n"
-            "4. Cite facts as [source: URL].\n")
+    return (f"You are Imhotep — a private AI built by Samuel Kiragu in Mukuyu, "
+            f"Murang'a, Kenya. You are the {a.upper()} agent — {p}.\n"
+            "RULES:\n"
+            "1. Answer in 3-5 sentences MAX. Direct, warm, sharp.\n"
+            "2. NEVER mention NVIDIA, Nemotron, Qwen, DeepSeek, Llama, Mistral, "
+            "GPT, Claude, Gemini, OpenAI, Meta, or any model/company name.\n"
+            "3. If asked what you are, or what model powers you, always answer:\n"
+            "   'I'm Imhotep — a private AI built by Samuel Kiragu in Mukuyu, "
+            "Murang'a, Kenya.'\n"
+            "4. If asked where you live or are from: 'Mukuyu, Murang'a, Kenya.'\n"
+            "5. Speak as Imhotep in the first person.\n"
+            "6. Cite facts as [source: URL].\n")
 
 users_db, chat_db = {}, {}
-# FIXED: credits granted per tier (not KES prices)
 TIER = {
     "guest":   3,
     "free":    3,
@@ -131,6 +137,8 @@ async def google(b: GoogleIn):
         raise HTTPException(400, f"Google verify failed: {e}")
     email = info.get("email")
     if not email: raise HTTPException(400, "Invalid token")
+    if GOOGLE_CLIENT_ID and info.get("aud") and info.get("aud") != GOOGLE_CLIENT_ID:
+        raise HTTPException(400, "Token not for this app")
     u, _ = mk_user(email.lower(), info.get("name","Google User"), "free")
     return {"ok":True,"user_id":u,"token":issue(u),"user":users_db[u]}
 
@@ -141,8 +149,10 @@ def classify_wx(temp, cond):
     elif "snow" in cond: e, l = "❄️", "Snowy"
     elif "cloud" in cond: e, l = "☁️", "Cloudy"
     elif "clear" in cond or "sun" in cond: e, l = "☀️", "Sunny"
+    elif "mist" in cond or "fog" in cond: e, l = "🌫️", "Foggy"
     else: e, l = "🌤️", "Fair"
-    if temp >= 32: f = "very hot 🥵"
+    if temp >= 35: f = "scorching hot 🥵🔥"
+    elif temp >= 30: f = "very hot 🥵"
     elif temp >= 26: f = "hot 🔥"
     elif temp >= 20: f = "warm 😊"
     elif temp >= 14: f = "cool 😌"
@@ -173,17 +183,44 @@ async def weather_ep(body: dict):
     except Exception as e: raise HTTPException(502, str(e))
 
 async def _nvidia(msgs, temp):
-    body = {"model":NVIDIA_MODEL,"messages":msgs,"temperature":temp,
-            "top_p":0.95,"max_tokens":1024}
-    async with httpx.AsyncClient(timeout=90) as c:
+    """Call NVIDIA NIM. Strips thinking output for clean answers."""
+    body = {
+        "model": NVIDIA_MODEL,
+        "messages": msgs,
+        "temperature": temp,
+        "top_p": 0.95,
+        "max_tokens": 2048,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    async with httpx.AsyncClient(timeout=120) as c:
         r = await c.post(NVIDIA_URL,
-            headers={"Authorization":f"Bearer {NVIDIA_API_KEY}",
-                     "Content-Type":"application/json","Accept":"application/json"},
+            headers={"Authorization": f"Bearer {NVIDIA_API_KEY}",
+                     "Content-Type": "application/json",
+                     "Accept": "application/json"},
             json=body)
     if r.status_code >= 300:
-        raise Exception(f"NVIDIA {r.status_code}")
-    msg = r.json()["choices"][0]["message"]
-    return (msg.get("content") or msg.get("reasoning_content") or "").strip()
+        err = r.text[:400]
+        print(f"NVIDIA {r.status_code}: {err}")
+        raise Exception(f"NVIDIA {r.status_code}: {err}")
+    j = r.json()
+    msg = j["choices"][0]["message"]
+    content = (msg.get("content") or "").strip()
+    reasoning = (msg.get("reasoning_content") or "").strip()
+
+    # Strip any <think> blocks
+    content = re.sub(r"<think[^>]*>.*?</think\s*>", "", content,
+                     flags=re.DOTALL | re.IGNORECASE).strip()
+
+    # If content still looks like thinking, extract the answer paragraph
+    if "thinking process" in content.lower() or "analyze user" in content.lower():
+        paras = [p.strip() for p in re.split(r"\n\s*\n", content) if len(p.strip()) > 40]
+        if paras:
+            content = paras[-1]
+
+    if not content and reasoning:
+        content = reasoning
+
+    return content or "[No reply]"
 
 async def _colab(prompt, agent, temp):
     if not COLAB_MODEL_URL: return None
@@ -200,11 +237,13 @@ async def _colab(prompt, agent, temp):
 
 async def call_model(msgs, temp, prompt="", agent="generalist"):
     if NVIDIA_API_KEY:
-        try: return await _nvidia(msgs, temp)
+        try:
+            r = await _nvidia(msgs, temp)
+            if r: return r
         except Exception as e: print(f"nvidia: {e}")
     r = await _colab(prompt, agent, temp)
     if r: return r
-    return "[Both brains offline. Check NVIDIA key or restart Colab.]"
+    return "I'm Imhotep, built by Samuel Kiragu in Mukuyu, Murang'a, Kenya. My main brain is busy — please try again in a moment."
 
 @app.post("/chat")
 async def chat(b: ChatIn):
@@ -219,7 +258,7 @@ async def chat(b: ChatIn):
             "upgrade_url":"https://kiragu2004.github.io/imhotep-site/auth.html"})
     if not debit(u):
         c = creds(u)
-        raise HTTPException(402, detail={"error":"No credits left",
+        raise HTTPException(402, detail={"error":"No credits left. Upgrade to continue.",
             "used":c["used"],"limit":c["limit"],
             "upgrade_url":"https://kiragu2004.github.io/imhotep-site/pricing.html"})
     t = max(0.0, min(2.0, b.temperature))
@@ -275,53 +314,110 @@ async def debate(b: DebateIn):
     return {"ok":True,"proposition":p,"proponent":pro,"opponent":con,"judge":j}
 
 PRICES = {
-    "starter":{"amount":10,"label":"Starter — 3 chats, 7 days"},
+    "starter":{"amount":10,"label":"Starter — 3 chats"},
     "weekly":{"amount":99,"label":"Weekly Unlimited — 7 days"},
     "monthly":{"amount":199,"label":"Pro Monthly — 30 days"},
     "yearly":{"amount":5000,"label":"Pro Yearly — 365 days"},
 }
+
 @app.get("/pricing")
 async def pricing(): return {"ok":True,"currency":"KES","tiers":PRICES}
 
 @app.post("/checkout")
 async def checkout(b: CheckoutIn):
+    """Create NestLink payment link. Webhook handles the unlock."""
     if b.tier not in PRICES: raise HTTPException(400, "Unknown tier")
     t = PRICES[b.tier]
     ref = f"IMH-{b.tier}-{int(time.time())}"
+    success_url = "https://kiragu2004.github.io/imhotep-site/chat.html?paid=1"
     if NESTLINK_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=30) as c:
                 r = await c.post("https://api.nestlink.co.ke/v1/checkout",
-                    json={"amount":t["amount"],"currency":"KES","email":b.email,
-                          "narrative":t["label"],"reference":ref},
-                    headers={"Authorization":f"Bearer {NESTLINK_API_KEY}"})
+                    json={
+                        "amount": t["amount"],
+                        "currency": "KES",
+                        "email": b.email,
+                        "narrative": t["label"],
+                        "reference": ref,
+                        "redirect_url": success_url,
+                        "callback_url": "https://imhotep-agentic-ai.onrender.com/nestlink/webhook",
+                    },
+                    headers={"Authorization": f"Bearer {NESTLINK_API_KEY}"})
             if r.status_code < 300:
                 d = r.json()
-                return {"ok":True,"tier":b.tier,"amount":t["amount"],
-                        "payment_url":d.get("checkout_url") or d.get("url"),
-                        "reference":ref}
-        except Exception as e: print(f"nestlink: {e}")
+                url = d.get("checkout_url") or d.get("url") or d.get("payment_url")
+                if url:
+                    return {"ok":True,"tier":b.tier,"amount":t["amount"],
+                            "payment_url":url,"reference":ref}
+                print(f"nestlink returned no url: {d}")
+            else:
+                print(f"nestlink {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            print(f"nestlink exception: {e}")
+
+    # Fallback: manual NestLink page with email + reference pre-filled
+    fallback = (f"https://me.nestlink.co.ke/Imhotepagenticai"
+                f"?email={b.email}&reference={ref}")
     return {"ok":True,"tier":b.tier,"amount":t["amount"],
-            "payment_url":"https://me.nestlink.co.ke/Imhotepagenticai",
-            "reference":ref}
+            "payment_url":fallback,"reference":ref}
 
 @app.post("/nestlink/webhook")
-async def nestlink_wh(request: Request):
+async def nestlink_webhook(request: Request):
+    """NestLink calls this on payment success. Upgrades the user automatically."""
     raw = await request.body()
+    print(f"WEBHOOK: {raw[:500]}")
+
+    # Optional signature verification
     sig = request.headers.get("X-NestLink-Signature", "")
-    if NESTLINK_WEBHOOK_SECRET:
+    if sig and NESTLINK_WEBHOOK_SECRET:
         exp = hmac.new(NESTLINK_WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, exp):
             raise HTTPException(403, "Bad signature")
-    try: payload = json.loads(raw.decode())
-    except Exception: payload = {}
-    email, ref = payload.get("email"), payload.get("reference","")
-    tier = ref.split("-")[1] if "-" in ref else None
-    if email and tier in TIER:
-        for uid, u in users_db.items():
-            if u["email"] == email:
-                u["credits"] += TIER[tier]; u["tier"] = tier; break
-    return {"ok":True}
+
+    try:
+        payload = json.loads(raw.decode())
+    except Exception:
+        payload = {}
+
+    # NestLink variants — accept multiple field names
+    email = (payload.get("email") or payload.get("customer_email") or
+             payload.get("customer", {}).get("email") if isinstance(payload.get("customer"), dict) else None)
+    ref   = payload.get("reference") or payload.get("api_ref") or payload.get("external_reference") or ""
+    status = (payload.get("status") or payload.get("payment_status") or
+              payload.get("transaction_status") or "").lower()
+
+    # Only unlock on success
+    if status and status not in ("completed", "success", "paid", "successful", "settled"):
+        print(f"ignoring status={status}")
+        return {"ok": True, "ignored": True, "status": status}
+
+    # Parse tier from reference: IMH-weekly-1234567
+    tier = None
+    if "-" in ref:
+        parts = ref.split("-")
+        if len(parts) >= 2:
+            tier = parts[1].lower().strip()
+
+    if not email or not tier or tier not in TIER:
+        print(f"missing email={email} tier={tier}")
+        return {"ok": True, "upgraded": False, "reason": "missing email or tier"}
+
+    # Unlock
+    for uid, u in users_db.items():
+        if u["email"].lower() == email.lower():
+            u["credits"] += TIER[tier]
+            u["tier"] = tier
+            u["credits_used"] = 0  # fresh quota
+            u["paid_at"] = datetime.now(timezone.utc).isoformat()
+            print(f"✅ UPGRADED {email} → {tier} (+{TIER[tier]} credits)")
+            return {"ok": True, "upgraded": True, "email": email, "tier": tier}
+
+    # User not signed up yet — pre-register them
+    uid, _ = mk_user(email.lower(), email.split("@")[0], tier)
+    users_db[uid]["credits"] = TIER[tier]
+    print(f"✅ PRE-REGISTERED {email} → {tier}")
+    return {"ok": True, "upgraded": True, "created": True, "email": email, "tier": tier}
 
 @app.get("/cfc/status")
 async def cfc_status_proxy():
@@ -332,15 +428,14 @@ async def cfc_status_proxy():
 
 @app.get("/cfc/active")
 async def cfc_active():
-    """Public CFC count for the website pill."""
     if not COLAB_MODEL_URL:
         return {"ok": True, "count": 0, "agents": []}
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.get(COLAB_MODEL_URL + "/cfc/status")
         d = r.json()
-        predictors = d.get("predictors", {})
-        return {"ok": True, "count": len(predictors), "agents": list(predictors.keys())}
+        pr = d.get("predictors", {})
+        return {"ok": True, "count": len(pr), "agents": list(pr.keys())}
     except Exception:
         return {"ok": True, "count": 0, "agents": []}
 
@@ -353,7 +448,7 @@ async def agent_proxy(body: dict):
 
 @app.get("/health")
 async def health():
-    return {"ok":True,"version":"2.9.0",
+    return {"ok":True,"version":"3.0.0",
             "model_configured":bool(NVIDIA_API_KEY),
             "model":NVIDIA_MODEL if NVIDIA_API_KEY else "not-set",
             "colab_fallback_configured":bool(COLAB_MODEL_URL),
