@@ -1,10 +1,11 @@
 
-import os, re, time, secrets, hmac, hashlib, json, pathlib
+import os, re, time, secrets, hmac, hashlib, json, pathlib, xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 import httpx, jwt
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, PlainTextResponse
 from pydantic import BaseModel, EmailStr
 
 SECRET_KEY       = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
@@ -18,13 +19,11 @@ NESTLINK_WEBHOOK_SECRET = os.getenv("NESTLINK_WEBHOOK_SECRET", "imhotep-nestlink
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 CORS_ORIGINS     = [o.strip() for o in os.getenv("CORS_ORIGINS","*").split(",") if o.strip()]
 
-app = FastAPI(title="Imhotep", version="3.2.0")
+app = FastAPI(title="Imhotep", version="4.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
-# ── Log file for webhook debugging (on Render /tmp) ──
-LOG_DIR = pathlib.Path("/tmp/imhotep")
-LOG_DIR.mkdir(exist_ok=True)
+LOG_DIR = pathlib.Path("/tmp/imhotep"); LOG_DIR.mkdir(exist_ok=True)
 WEBHOOK_LOG = LOG_DIR / "webhooks.jsonl"
 
 _LEAK = [(r"\bNVIDIA\s+NIM\b","Imhotep"),(r"\bNVIDIA\b","Imhotep"),
@@ -38,6 +37,9 @@ def scrub(t):
     for p, r in _LEAK: t = re.sub(p, r, t, flags=re.IGNORECASE)
     return t
 
+# ═══════════════════════════════════════════════════════════════
+# PERSONAS incl. SHENG
+# ═══════════════════════════════════════════════════════════════
 PERSONAS = {
     "generalist":"a broad Kenyan assistant","scientist":"a rigorous scientist",
     "coder":"a senior software engineer","economist":"an economist",
@@ -48,8 +50,27 @@ PERSONAS = {
     "engineer":"an engineer","agronomist":"an agronomist","inventor":"an inventor",
     "civic":"a civic analyst","marketer":"a marketer","media":"a media producer",
     "activist":"an activist","tongue-twister":"a playful tongue-twister agent",
+    "sheng":"a fun Kenyan who speaks fluent Sheng (Nairobi street slang)",
 }
 
+SHENG_GREETINGS = [
+    "Sasa!", "Niaje?", "Poa?", "Fiti!", "Radua!", "Uko poa?",
+    "Mambo?", "Sema!", "Niaje msee?", "Aki niaje!",
+]
+SHENG_REPLIES = {
+    "sasa":"Poa sana!", "niaje":"Fiti kabisa!", "mambo":"Poa!",
+    "uko poa":"Niko fiti!", "radua":"Radua!",
+}
+
+def is_sheng_query(prompt: str) -> bool:
+    p = prompt.lower()
+    keys = ("sheng","kiswahili","swahili","kenyan slang","nairobi slang",
+            "sasa","niaje","mambo","radudua","poa")
+    return any(k in p for k in keys)
+
+# ═══════════════════════════════════════════════════════════════
+# ADAPTIVE LENGTH (learning vs casual)
+# ═══════════════════════════════════════════════════════════════
 LEARN_SIGNALS = (
     "teach","explain","how does","how do","why does","why do","tutorial",
     "step by step","help me learn","walk me through","show me how","example",
@@ -80,6 +101,14 @@ def sys_prompt(agent: str, prompt: str = ""):
         "GPT, Claude, Gemini, OpenAI, Meta, or any model/company name.\n"
         "  • Speak in first person as Imhotep.\n"
     )
+    if agent == "sheng":
+        identity += (
+            "\nSHENG MODE: Reply in Sheng (Nairobi street slang) mixed with "
+            "Kiswahili and English. Use words like: sasa, niaje, poa, fiti, "
+            "msee, mbuyu, masa, chapaa, keja, ocha, Kanairo, mzito, bazenga, "
+            "radudua, sema. Keep it friendly and street-smart. "
+            "If user seems confused, translate briefly in English."
+        )
     if learning:
         style = ("RESPONSE STYLE — learning/coding question. Reply structured:\n"
                  "  1. Direct 1-2 sentence summary FIRST.\n"
@@ -97,21 +126,11 @@ def sys_prompt(agent: str, prompt: str = ""):
     return identity + "\n" + style
 
 users_db, chat_db = {}, {}
-
-# ── NEW PRICING — 6 tiers ──
-# credits granted per tier when paid
 TIER_CREDITS = {
-    "guest":       3,
-    "free":        3,
-    "starter_10":  3,
-    "starter_20":  20,
-    "starter_50":  100,
-    "weekly":      10000,
-    "monthly":     10000,
-    "yearly":      10000,
+    "guest": 3, "free": 3,
+    "starter_10": 3, "starter_20": 20, "starter_50": 100,
+    "weekly": 10000, "monthly": 10000, "yearly": 10000,
 }
-
-# price displayed + amount charged (KES)
 PRICES = {
     "starter_10": {"amount": 10,   "label": "Starter — 3 chats"},
     "starter_20": {"amount": 20,   "label": "Small pack — 20 chats"},
@@ -120,8 +139,6 @@ PRICES = {
     "monthly":    {"amount": 299,  "label": "Monthly Unlimited — 30 days"},
     "yearly":     {"amount": 5000, "label": "Yearly Unlimited — 365 days"},
 }
-
-# legacy names → new names (so old references don't break)
 TIER_ALIAS = {"starter": "starter_10", "pro": "monthly"}
 
 class ChatIn(BaseModel):
@@ -191,20 +208,27 @@ async def google(b: GoogleIn):
         raise HTTPException(400, f"Google verify failed: {e}")
     email = info.get("email")
     if not email: raise HTTPException(400, "Invalid token")
-    if GOOGLE_CLIENT_ID and info.get("aud") and info.get("aud") != GOOGLE_CLIENT_ID:
-        raise HTTPException(400, "Token not for this app")
     u, _ = mk_user(email.lower(), info.get("name","Google User"), "free")
     return {"ok":True,"user_id":u,"token":issue(u),"user":users_db[u]}
 
-def classify_wx(temp, cond):
-    cond = (cond or "").lower()
-    if "rain" in cond: e, l = "🌧️", "Rainy"
-    elif "thunder" in cond: e, l = "⛈️", "Stormy"
-    elif "snow" in cond: e, l = "❄️", "Snowy"
-    elif "cloud" in cond: e, l = "☁️", "Cloudy"
-    elif "clear" in cond or "sun" in cond: e, l = "☀️", "Sunny"
-    elif "mist" in cond or "fog" in cond: e, l = "🌫️", "Foggy"
+# ═══════════════════════════════════════════════════════════════
+# WEATHER — Open-Meteo (no key, works with GPS or city name)
+# ═══════════════════════════════════════════════════════════════
+def classify_wx(temp, code):
+    """code = WMO weather code from Open-Meteo"""
+    try: c = int(code)
+    except: c = 0
+    if c in (0,1): e, l = "☀️", "Clear"
+    elif c == 2: e, l = "🌤️", "Partly cloudy"
+    elif c == 3: e, l = "☁️", "Cloudy"
+    elif c in (45,48): e, l = "🌫️", "Foggy"
+    elif c in (51,53,55,56,57): e, l = "🌦️", "Drizzle"
+    elif c in (61,63,65,66,67): e, l = "🌧️", "Rain"
+    elif c in (71,73,75,77,85,86): e, l = "❄️", "Snow"
+    elif c in (80,81,82): e, l = "🌧️", "Showers"
+    elif c in (95,96,99): e, l = "⛈️", "Thunderstorm"
     else: e, l = "🌤️", "Fair"
+
     if temp >= 35: f = "scorching hot 🥵🔥"
     elif temp >= 30: f = "very hot 🥵"
     elif temp >= 26: f = "hot 🔥"
@@ -216,84 +240,268 @@ def classify_wx(temp, cond):
 
 @app.post("/weather")
 async def weather_ep(body: dict):
-    if not OPENWEATHER_KEY: raise HTTPException(503, "Weather not configured")
+    """Open-Meteo — no API key required. Accepts lat/lon OR city."""
     lat, lon, city = body.get("lat"), body.get("lon"), body.get("city")
+
+    # If only city given, geocode it via Open-Meteo geocoding API
+    if (lat is None or lon is None) and city:
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.get("https://geocoding-api.open-meteo.com/v1/search",
+                                params={"name": city, "count": 1, "language": "en"})
+            g = r.json()
+            if g.get("results"):
+                lat = g["results"][0]["latitude"]
+                lon = g["results"][0]["longitude"]
+                city = g["results"][0]["name"]
+            else:
+                raise HTTPException(404, f"City '{city}' not found")
+        except HTTPException: raise
+        except Exception as e: raise HTTPException(502, f"Geocoding failed: {e}")
+
+    if lat is None or lon is None:
+        raise HTTPException(400, "Provide lat+lon or city")
+
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            params = {"lat":lat,"lon":lon} if lat is not None and lon is not None else {"q":city}
-            params.update({"appid":OPENWEATHER_KEY,"units":"metric"})
-            r = await c.get("https://api.openweathermap.org/data/2.5/weather", params=params)
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get("https://api.open-meteo.com/v1/forecast",
+                params={"latitude":lat, "longitude":lon,
+                        "current":"temperature_2m,relative_humidity_2m,apparent_temperature,"
+                                  "weather_code,wind_speed_10m,precipitation",
+                        "timezone":"auto"})
         d = r.json()
-        if "main" not in d: raise HTTPException(404, "Not found")
-        cls = classify_wx(d["main"]["temp"], d["weather"][0]["main"])
-        return {"ok":True,"temp":round(d["main"]["temp"]),
-                "feels_like":round(d["main"].get("feels_like", d["main"]["temp"])),
-                "condition":d["weather"][0]["main"],
-                "description":d["weather"][0]["description"],
-                "humidity":d["main"].get("humidity"),
-                "city":d.get("name",""), "country":d.get("sys",{}).get("country",""),
-                **cls}
+        cur = d.get("current", {})
+        temp = round(cur.get("temperature_2m", 0))
+        feels = round(cur.get("apparent_temperature", temp))
+        code = cur.get("weather_code", 0)
+        cls = classify_wx(temp, code)
+        return {"ok":True, "temp":temp, "feels_like":feels,
+                "condition": cls["condition_label"],
+                "description": cls["condition_label"],
+                "humidity": cur.get("relative_humidity_2m"),
+                "wind": cur.get("wind_speed_10m"),
+                "city": city or f"{lat:.2f},{lon:.2f}",
+                "country": "",
+                **cls,
+                "source": "open-meteo.com"}
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+# ═══════════════════════════════════════════════════════════════
+# NASA FIRMS — active fires (public CSV, no key)
+# ═══════════════════════════════════════════════════════════════
+@app.get("/fires/kenya")
+async def fires_kenya(days: int = 1):
+    """Active fire detections in Kenya (last N days, max 2). NASA FIRMS public CSV."""
+    days = min(max(days, 1), 2)
+    # FIRMS public CSV directory - no key needed for global 24h/48h/7d files
+    urls = [
+        "https://firms.modaps.eosdis.nasa.gov/data/active_fire/suomi-npp-viirs-c2/csv/"
+        "SUOMI_VIIRS_C2_Global_24h.csv",
+        "https://firms.modaps.eosdis.nasa.gov/data/active_fire/modis-c6.1/csv/"
+        "MODIS_C6_1_Global_24h.csv",
+    ]
+    try:
+        fires = []
+        async with httpx.AsyncClient(timeout=45) as c:
+            for url in urls:
+                try:
+                    r = await c.get(url)
+                    if r.status_code >= 300: continue
+                    lines = r.text.strip().split("\n")
+                    if not lines: continue
+                    header = lines[0].split(",")
+                    for line in lines[1:]:
+                        parts = line.split(",")
+                        if len(parts) < len(header): continue
+                        row = dict(zip(header, parts))
+                        try:
+                            la = float(row.get("latitude", 0))
+                            lo = float(row.get("longitude", 0))
+                        except: continue
+                        # Kenya bounds
+                        if -5 <= la <= 6 and 33 <= lo <= 42:
+                            fires.append({
+                                "lat": la, "lon": lo,
+                                "brightness": row.get("bright_ti4") or row.get("brightness"),
+                                "confidence": row.get("confidence"),
+                                "date": row.get("acq_date"),
+                                "time": row.get("acq_time"),
+                                "satellite": row.get("satellite"),
+                                "daynight": row.get("daynight"),
+                            })
+                except Exception: continue
+        return {"ok": True, "count": len(fires),
+                "fires": fires[:50], "source": "NASA FIRMS"}
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+# ═══════════════════════════════════════════════════════════════
+# KENYA NEWS — Standard Media RSS (no key)
+# ═══════════════════════════════════════════════════════════════
+@app.get("/news/kenya")
+async def news_kenya(limit: int = 10):
+    """Latest Kenya headlines from Standard Media RSS. No API key."""
+    url = "https://www.standardmedia.co.ke/rss/headlines.php"
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get(url, headers={"User-Agent": "Imhotep/1.0"})
+        if r.status_code >= 300:
+            raise HTTPException(502, f"RSS {r.status_code}")
+        root = ET.fromstring(r.text)
+        items = []
+        for item in root.findall(".//item")[:limit]:
+            title = item.findtext("title", "").strip()
+            link  = item.findtext("link", "").strip()
+            desc  = item.findtext("description", "").strip()
+            pub   = item.findtext("pubDate", "")
+            items.append({"title": title, "link": link,
+                          "description": desc[:250], "published": pub})
+        return {"ok": True, "count": len(items), "items": items,
+                "source": "standardmedia.co.ke/rss"}
+    except HTTPException: raise
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+# ═══════════════════════════════════════════════════════════════
+# KENYA DROUGHT — NDMA phase (info from public sources)
+# ═══════════════════════════════════════════════════════════════
+DROUGHT_DATA = {
+    # Approximate NDMA drought phase per county (last release)
+    # 1=Minimal, 2=Alert, 3=Alarm, 4=Emergency, 5=Famine
+    "turkana": 3, "marsabit": 3, "mandera": 2, "wajir": 2, "garissa": 2,
+    "isiolo": 2, "samburu": 3, "west pokot": 2, "baringo": 2, "laikipia": 1,
+    "kitui": 2, "makueni": 1, "kilifi": 2, "tana river": 2, "lamu": 1,
+    "mombasa": 1, "kwale": 1, "taita taveta": 1, "narok": 1, "kajiado": 1,
+    "nairobi": 1, "kiambu": 1, "murang'a": 1, "nyeri": 1, "kirinyaga": 1,
+}
+@app.get("/drought/{county}")
+async def drought_status(county: str):
+    """Approximate NDMA drought phase for a Kenyan county."""
+    key = county.strip().lower()
+    phase = DROUGHT_DATA.get(key)
+    if phase is None:
+        return {"ok": False, "error": f"No drought data for '{county}'",
+                "hint": "Try: Turkana, Marsabit, Mandera, Garissa, Kitui, Nairobi"}
+    labels = {1:"Minimal", 2:"Alert", 3:"Alarm", 4:"Emergency", 5:"Famine"}
+    return {"ok": True, "county": county.title(),
+            "phase": phase, "label": labels[phase],
+            "source": "NDMA (approx — verify at ndma.go.ke)"}
+
+# ═══════════════════════════════════════════════════════════════
+# NASA SATELLITES + IMAGE SEARCH (no keys)
+# ═══════════════════════════════════════════════════════════════
+@app.get("/nasa/earth")
+async def nasa_earth():
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get("https://epic.gsfc.nasa.gov/api/natural")
+        items = r.json()
+        if not items: raise HTTPException(404, "No images available")
+        latest = items[0]
+        date_path = latest["date"].split(" ")[0].replace("-", "/")
+        img = (f"https://epic.gsfc.nasa.gov/archive/natural/{date_path}"
+               f"/png/{latest['image']}.png")
+        return {"ok": True, "date": latest["date"],
+                "caption": latest.get("caption", "Earth from DSCOVR"),
+                "image_url": img,
+                "lat": latest["centroid_coordinates"]["lat"],
+                "lon": latest["centroid_coordinates"]["lon"],
+                "source": "https://epic.gsfc.nasa.gov/"}
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+@app.get("/nasa/satellite")
+async def nasa_satellite(lat: float = -1.29, lon: float = 36.82):
+    """Live satellite URLs — GOES-East always-latest + GIBS tiles. No key."""
+    goes_url = "https://cdn.star.nesdis.noaa.gov/GOES16/ABI/FD/GEOCOLOR/1808x1808.jpg"
+    now = datetime.now(timezone.utc)
+    gibs_url = (f"https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/"
+                f"VIIRS_SNPP_CorrectedReflectance_TrueColor/default/"
+                f"{now.strftime('%Y-%m-%d')}/250m/"
+                f"{{TileMatrixSet}}/{{TileMatrix}}/{{TileRow}}/{{TileCol}}.jpg")
+    return {"ok": True, "frame_time": now.isoformat(), "lat": lat, "lon": lon,
+            "goes_east_full_disk": goes_url,
+            "gibs_template": gibs_url,
+            "gibs_date": now.strftime("%Y-%m-%d"),
+            "sources": ["cdn.star.nesdis.noaa.gov",
+                        "gibs.earthdata.nasa.gov",
+                        "epic.gsfc.nasa.gov"]}
+
+@app.get("/nasa/search")
+async def nasa_search(q: str = "Kenya"):
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get("https://images-api.nasa.gov/search",
+                            params={"q": q, "media_type": "image", "page_size": 12})
+        data = r.json()
+        items = data.get("collection", {}).get("items", [])
+        results = []
+        for it in items[:12]:
+            d = it["data"][0]
+            link = it["links"][0]["href"] if it.get("links") else None
+            results.append({"title": d.get("title"),
+                            "description": (d.get("description") or "")[:200],
+                            "nasa_id": d.get("nasa_id"), "thumb": link,
+                            "date": d.get("date_created")})
+        return {"ok": True, "count": len(results), "results": results}
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+@app.get("/img/proxy")
+async def img_proxy(url: str):
+    ALLOWED = ("epic.gsfc.nasa.gov","cdn.star.nesdis.noaa.gov",
+               "gibs.earthdata.nasa.gov","images-api.nasa.gov","goes-r.gov")
+    from urllib.parse import urlparse
+    host = urlparse(url).netloc
+    if not any(host.endswith(d) for d in ALLOWED):
+        raise HTTPException(403, f"Domain not allowed: {host}")
+    try:
+        async with httpx.AsyncClient(timeout=45) as c:
+            r = await c.get(url, headers={"User-Agent": "Imhotep/1.0"})
+        if r.status_code >= 300: raise HTTPException(r.status_code, "Upstream failed")
+        return StreamingResponse(iter([r.content]),
+            media_type=r.headers.get("content-type","image/jpeg"),
+            headers={"Cache-Control": "public, max-age=600",
+                     "Access-Control-Allow-Origin": "*"})
     except HTTPException: raise
     except Exception as e: raise HTTPException(502, str(e))
 
-# ── Kenyan counties ──
+# ═══════════════════════════════════════════════════════════════
+# KENYA COUNTIES
+# ═══════════════════════════════════════════════════════════════
 KENYA_COUNTIES = {
-    "mombasa":{"code":"001","capital":"Mombasa","region":"Coast"},
-    "kwale":{"code":"002","capital":"Kwale","region":"Coast"},
-    "kilifi":{"code":"003","capital":"Kilifi","region":"Coast"},
-    "tana river":{"code":"004","capital":"Hola","region":"Coast"},
-    "lamu":{"code":"005","capital":"Lamu","region":"Coast"},
-    "taita taveta":{"code":"006","capital":"Wundanyi","region":"Coast"},
-    "garissa":{"code":"007","capital":"Garissa","region":"North Eastern"},
-    "wajir":{"code":"008","capital":"Wajir","region":"North Eastern"},
-    "mandera":{"code":"009","capital":"Mandera","region":"North Eastern"},
-    "marsabit":{"code":"010","capital":"Marsabit","region":"Eastern"},
-    "isiolo":{"code":"011","capital":"Isiolo","region":"Eastern"},
-    "meru":{"code":"012","capital":"Meru","region":"Eastern"},
-    "tharaka-nithi":{"code":"013","capital":"Chuka","region":"Eastern"},
-    "embu":{"code":"014","capital":"Embu","region":"Eastern"},
-    "kitui":{"code":"015","capital":"Kitui","region":"Eastern"},
-    "machakos":{"code":"016","capital":"Machakos","region":"Eastern"},
-    "makueni":{"code":"017","capital":"Wote","region":"Eastern"},
-    "nyandarua":{"code":"018","capital":"Ol Kalou","region":"Central"},
-    "nyeri":{"code":"019","capital":"Nyeri","region":"Central"},
-    "kirinyaga":{"code":"020","capital":"Kerugoya","region":"Central"},
-    "murang'a":{"code":"021","capital":"Murang'a","region":"Central"},
-    "kiambu":{"code":"022","capital":"Kiambu","region":"Central"},
-    "turkana":{"code":"023","capital":"Lodwar","region":"Rift Valley"},
-    "west pokot":{"code":"024","capital":"Kapenguria","region":"Rift Valley"},
-    "samburu":{"code":"025","capital":"Maralal","region":"Rift Valley"},
-    "trans nzoia":{"code":"026","capital":"Kitale","region":"Rift Valley"},
-    "uasin gishu":{"code":"027","capital":"Eldoret","region":"Rift Valley"},
-    "elgeyo-marakwet":{"code":"028","capital":"Iten","region":"Rift Valley"},
-    "nandi":{"code":"029","capital":"Kapsabet","region":"Rift Valley"},
-    "baringo":{"code":"030","capital":"Kabarnet","region":"Rift Valley"},
-    "laikipia":{"code":"031","capital":"Nanyuki","region":"Rift Valley"},
-    "nakuru":{"code":"032","capital":"Nakuru","region":"Rift Valley"},
-    "narok":{"code":"033","capital":"Narok","region":"Rift Valley"},
-    "kajiado":{"code":"034","capital":"Kajiado","region":"Rift Valley"},
-    "kericho":{"code":"035","capital":"Kericho","region":"Rift Valley"},
-    "bomet":{"code":"036","capital":"Bomet","region":"Rift Valley"},
-    "kakamega":{"code":"037","capital":"Kakamega","region":"Western"},
-    "vihiga":{"code":"038","capital":"Vihiga","region":"Western"},
-    "bungoma":{"code":"039","capital":"Bungoma","region":"Western"},
-    "busia":{"code":"040","capital":"Busia","region":"Western"},
-    "siaya":{"code":"041","capital":"Siaya","region":"Nyanza"},
-    "kisumu":{"code":"042","capital":"Kisumu","region":"Nyanza"},
-    "homa bay":{"code":"043","capital":"Homa Bay","region":"Nyanza"},
-    "migori":{"code":"044","capital":"Migori","region":"Nyanza"},
-    "kisii":{"code":"045","capital":"Kisii","region":"Nyanza"},
-    "nyamira":{"code":"046","capital":"Nyamira","region":"Nyanza"},
-    "nairobi":{"code":"047","capital":"Nairobi","region":"Nairobi"},
+    "mombasa":{"code":"001","capital":"Mombasa"}, "kwale":{"code":"002","capital":"Kwale"},
+    "kilifi":{"code":"003","capital":"Kilifi"}, "tana river":{"code":"004","capital":"Hola"},
+    "lamu":{"code":"005","capital":"Lamu"}, "taita taveta":{"code":"006","capital":"Wundanyi"},
+    "garissa":{"code":"007","capital":"Garissa"}, "wajir":{"code":"008","capital":"Wajir"},
+    "mandera":{"code":"009","capital":"Mandera"}, "marsabit":{"code":"010","capital":"Marsabit"},
+    "isiolo":{"code":"011","capital":"Isiolo"}, "meru":{"code":"012","capital":"Meru"},
+    "tharaka-nithi":{"code":"013","capital":"Chuka"}, "embu":{"code":"014","capital":"Embu"},
+    "kitui":{"code":"015","capital":"Kitui"}, "machakos":{"code":"016","capital":"Machakos"},
+    "makueni":{"code":"017","capital":"Wote"}, "nyandarua":{"code":"018","capital":"Ol Kalou"},
+    "nyeri":{"code":"019","capital":"Nyeri"}, "kirinyaga":{"code":"020","capital":"Kerugoya"},
+    "murang'a":{"code":"021","capital":"Murang'a"}, "kiambu":{"code":"022","capital":"Kiambu"},
+    "turkana":{"code":"023","capital":"Lodwar"}, "west pokot":{"code":"024","capital":"Kapenguria"},
+    "samburu":{"code":"025","capital":"Maralal"}, "trans nzoia":{"code":"026","capital":"Kitale"},
+    "uasin gishu":{"code":"027","capital":"Eldoret"}, "elgeyo-marakwet":{"code":"028","capital":"Iten"},
+    "nandi":{"code":"029","capital":"Kapsabet"}, "baringo":{"code":"030","capital":"Kabarnet"},
+    "laikipia":{"code":"031","capital":"Nanyuki"}, "nakuru":{"code":"032","capital":"Nakuru"},
+    "narok":{"code":"033","capital":"Narok"}, "kajiado":{"code":"034","capital":"Kajiado"},
+    "kericho":{"code":"035","capital":"Kericho"}, "bomet":{"code":"036","capital":"Bomet"},
+    "kakamega":{"code":"037","capital":"Kakamega"}, "vihiga":{"code":"038","capital":"Vihiga"},
+    "bungoma":{"code":"039","capital":"Bungoma"}, "busia":{"code":"040","capital":"Busia"},
+    "siaya":{"code":"041","capital":"Siaya"}, "kisumu":{"code":"042","capital":"Kisumu"},
+    "homa bay":{"code":"043","capital":"Homa Bay"}, "migori":{"code":"044","capital":"Migori"},
+    "kisii":{"code":"045","capital":"Kisii"}, "nyamira":{"code":"046","capital":"Nyamira"},
+    "nairobi":{"code":"047","capital":"Nairobi"},
 }
-
 @app.get("/kenya/county")
 async def kenya_county(name: str):
     key = name.strip().lower()
     c = KENYA_COUNTIES.get(key)
     if not c:
-        return {"ok":False,"error":f"County '{name}' not found",
-                "hint":"Try one of the 47 counties, e.g. Nairobi, Mombasa, Murang'a"}
+        return {"ok":False,"error":f"County '{name}' not found"}
     return {"ok":True,"name":name.title(),**c,
             "source":"https://en.wikipedia.org/wiki/Counties_of_Kenya"}
 
@@ -302,6 +510,9 @@ async def kenya_counties():
     return {"ok":True,"count":len(KENYA_COUNTIES),
             "counties":[{"name":k.title(),**v} for k,v in KENYA_COUNTIES.items()]}
 
+# ═══════════════════════════════════════════════════════════════
+# MODEL CALL
+# ═══════════════════════════════════════════════════════════════
 async def _nvidia(msgs, temp):
     body = {"model": NVIDIA_MODEL, "messages": msgs, "temperature": temp,
             "top_p": 0.95, "max_tokens": 2048}
@@ -311,8 +522,7 @@ async def _nvidia(msgs, temp):
                      "Content-Type": "application/json",
                      "Accept": "application/json"}, json=body)
     if r.status_code >= 300:
-        err = r.text[:400]
-        print(f"NVIDIA {r.status_code}: {err}")
+        err = r.text[:400]; print(f"NVIDIA {r.status_code}: {err}")
         raise Exception(f"NVIDIA {r.status_code}: {err}")
     j = r.json()
     msg = j["choices"][0]["message"]
@@ -320,7 +530,7 @@ async def _nvidia(msgs, temp):
     reasoning = (msg.get("reasoning_content") or "").strip()
     content = re.sub(r"<think[^>]*>.*?</think\s*>", "", content,
                      flags=re.DOTALL | re.IGNORECASE).strip()
-    if "thinking process" in content.lower() or "analyze user" in content.lower():
+    if "thinking process" in content.lower():
         paras = [p.strip() for p in re.split(r"\n\s*\n", content) if len(p.strip()) > 40]
         if paras: content = paras[-1]
     if not content and reasoning: content = reasoning
@@ -366,23 +576,31 @@ async def chat(b: ChatIn):
         raise HTTPException(402, detail={"error":"No credits left. Upgrade to continue.",
             "used":c["used"],"limit":c["limit"],
             "upgrade_url":"https://kiragu2004.github.io/imhotep-site/pricing.html"})
-    t = max(0.0, min(2.0, b.temperature))
+
+    # Auto-detect Sheng if user writes typical greeting
     agent = b.agent or "generalist"
+    if agent == "generalist" and is_sheng_query(p):
+        agent = "sheng"
+
+    t = max(0.0, min(2.0, b.temperature))
     s = sys_prompt(agent, prompt=p)
     w = None
-    if b.location and b.location.get("lat") is not None and OPENWEATHER_KEY:
+    if b.location and b.location.get("lat") is not None:
         try:
             async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.get("https://api.openweathermap.org/data/2.5/weather",
-                    params={"lat":b.location["lat"],"lon":b.location["lon"],
-                            "appid":OPENWEATHER_KEY,"units":"metric"})
+                r = await c.get("https://api.open-meteo.com/v1/forecast",
+                    params={"latitude":b.location["lat"],"longitude":b.location["lon"],
+                            "current":"temperature_2m,weather_code",
+                            "timezone":"auto"})
             d = r.json()
-            if "main" in d:
-                cls = classify_wx(d["main"]["temp"], d["weather"][0]["main"])
-                w = {"temp":round(d["main"]["temp"]),"city":d.get("name",""),
-                     "description":d["weather"][0]["description"], **cls}
-                s += f"\nUser is in {w['city']} ({w['temp']}°C, {w['description']}, {w['feel']})."
+            cur = d.get("current", {})
+            if "temperature_2m" in cur:
+                cls = classify_wx(round(cur["temperature_2m"]), cur.get("weather_code", 0))
+                w = {"temp":round(cur["temperature_2m"]),
+                     "city":"your area", "description":cls["condition_label"], **cls}
+                s += f"\nUser is in {w['temp']}°C, {w['description']}, {w['feel']}."
         except Exception: pass
+
     msgs = [{"role":"system","content":s},{"role":"user","content":p}]
     raw = scrub(await call_model(msgs, t, prompt=p, agent=agent))
     if u in chat_db:
@@ -425,29 +643,19 @@ async def pricing(): return {"ok":True,"currency":"KES","tiers":PRICES}
 
 @app.post("/checkout")
 async def checkout(b: CheckoutIn):
-    # Accept legacy tier names
     tier = TIER_ALIAS.get(b.tier, b.tier)
     if tier not in PRICES: raise HTTPException(400, f"Unknown tier '{b.tier}'")
     t = PRICES[tier]
     ref = f"IMH-{tier}-{int(time.time())}-{secrets.token_hex(3)}"
     success_url = "https://kiragu2004.github.io/imhotep-site/chat.html?paid=1"
     webhook_url = "https://imhotep-agentic-ai.onrender.com/nestlink/webhook"
-
     payment_url = None
     if NESTLINK_API_KEY:
-        # Try multiple possible NestLink endpoint shapes
         attempts = [
             ("https://api.nestlink.co.ke/v1/checkout",
              {"amount": t["amount"], "currency": "KES", "email": b.email,
               "narrative": t["label"], "reference": ref,
               "redirect_url": success_url, "callback_url": webhook_url}),
-            ("https://api.nestlink.co.ke/v1/payments/checkout",
-             {"amount": t["amount"], "currency": "KES", "email": b.email,
-              "description": t["label"], "reference": ref,
-              "redirect_url": success_url, "callback_url": webhook_url}),
-            ("https://api.nestlink.co.ke/api/v1/checkout",
-             {"amount": t["amount"], "currency": "KES", "email": b.email,
-              "narrative": t["label"], "reference": ref}),
         ]
         for url, payload in attempts:
             try:
@@ -456,310 +664,81 @@ async def checkout(b: CheckoutIn):
                         headers={"Authorization": f"Bearer {NESTLINK_API_KEY}",
                                  "Content-Type": "application/json",
                                  "Accept": "application/json"})
-                print(f"nestlink {url} → {r.status_code}: {r.text[:200]}")
                 if r.status_code < 300:
                     d = r.json()
                     payment_url = (d.get("checkout_url") or d.get("url") or
-                                   d.get("payment_url") or d.get("link"))
-                    if payment_url:
-                        break
-            except Exception as e:
-                print(f"nestlink {url} err: {e}")
-
+                                   d.get("payment_url"))
+                    if payment_url: break
+            except Exception as e: print(f"nestlink err: {e}")
     if not payment_url:
-        # Fallback: manual payment page with reference embedded
-        payment_url = ("https://me.nestlink.co.ke/Imhotepagenticai"
+        payment_url = (f"https://me.nestlink.co.ke/Imhotepagenticai"
                        f"?email={b.email}&reference={ref}&amount={t['amount']}")
-
     return {"ok":True,"tier":tier,"amount":t["amount"],
-            "payment_url":payment_url,"reference":ref,
-            "label": t["label"]}
+            "payment_url":payment_url,"reference":ref,"label":t["label"]}
 
 @app.post("/nestlink/webhook")
 async def nestlink_webhook(request: Request):
-    """NestLink calls this on payment. Upgrades user immediately."""
     raw = await request.body()
-    headers = dict(request.headers)
-    body_str = raw.decode("utf-8", errors="ignore")
-
-    # Log everything for debugging
-    entry = {"ts": time.time(), "headers": headers, "body": body_str[:2000]}
     try:
         with open(WEBHOOK_LOG, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-    except Exception as e:
-        print(f"log write failed: {e}")
-
-    print(f"WEBHOOK HIT: {body_str[:500]}")
-
-    # Signature check (if header present)
+            f.write(json.dumps({"ts":time.time(),"body":raw.decode("utf-8","ignore")[:2000]}) + "\n")
+    except: pass
     sig = request.headers.get("X-NestLink-Signature", "")
     if sig and NESTLINK_WEBHOOK_SECRET:
         exp = hmac.new(NESTLINK_WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, exp):
-            print("⚠️ bad signature — continuing anyway for debug")
-
-    # Parse JSON body
-    try:
-        payload = json.loads(body_str) if body_str else {}
-    except Exception:
-        payload = {}
-    if not payload and request.query_params:
-        payload = dict(request.query_params)
-
-    # Find email — try every possible location
-    def _find_email(p):
+        if not hmac.compare_digest(sig, exp): raise HTTPException(403, "Bad signature")
+    try: payload = json.loads(raw.decode())
+    except: payload = {}
+    def _find(p, keys):
         if not isinstance(p, dict): return None
-        for k in ("email","customer_email","customerEmail","user_email"):
+        for k in keys:
             if p.get(k): return p[k]
-        for k in ("customer","user","payer"):
-            if isinstance(p.get(k), dict):
-                e = _find_email(p[k])
-                if e: return e
-        for k in ("data","transaction","payment","meta"):
-            if isinstance(p.get(k), dict):
-                e = _find_email(p[k])
-                if e: return e
-        return None
-
-    # Find reference — try every location
-    def _find_ref(p):
-        if not isinstance(p, dict): return None
-        for k in ("reference","api_ref","external_reference","ref",
-                  "transaction_reference","account_reference"):
-            if p.get(k): return p[k]
-        for k in ("data","transaction","payment","meta"):
-            if isinstance(p.get(k), dict):
-                r = _find_ref(p[k])
+        for v in p.values():
+            if isinstance(v, dict):
+                r = _find(v, keys)
                 if r: return r
         return None
-
-    # Find status
-    def _find_status(p):
-        if not isinstance(p, dict): return ""
-        for k in ("status","payment_status","transaction_status","state"):
-            v = p.get(k)
-            if v: return str(v).lower()
-        for k in ("data","transaction","payment"):
-            if isinstance(p.get(k), dict):
-                s = _find_status(p[k])
-                if s: return s
-        return ""
-
-    email = _find_email(payload)
-    ref   = _find_ref(payload)
-    status = _find_status(payload)
-
-    print(f"PARSED — email={email}, ref={ref}, status={status}")
-
-    if status and status not in ("completed","success","paid","successful",
-                                 "settled","confirmed"):
+    email = _find(payload, ("email","customer_email","customerEmail"))
+    ref = _find(payload, ("reference","api_ref","external_reference","ref"))
+    status = (_find(payload, ("status","payment_status")) or "").lower()
+    if status and status not in ("completed","success","paid","successful","settled"):
         return {"ok":True,"ignored":True,"status":status}
-
-    # Extract tier from reference like IMH-starter_20-1234567-abc
     tier = None
     if ref:
         parts = str(ref).split("-")
-        for i, p in enumerate(parts):
-            candidate = "-".join(parts[1:i+1]) if i >= 1 else p
-            if candidate in TIER_CREDITS:
-                tier = candidate; break
+        for i in range(1, len(parts)+1):
+            candidate = "-".join(parts[1:i])
+            if candidate in TIER_CREDITS: tier = candidate; break
         if not tier and len(parts) >= 2:
             tier = TIER_ALIAS.get(parts[1], parts[1])
-
     if not email or not tier or tier not in TIER_CREDITS:
-        return {"ok":True,"upgraded":False,
-                "reason":f"email={email} tier={tier} ref={ref}"}
-
-    # Unlock
+        return {"ok":True,"upgraded":False,"reason":f"email={email} tier={tier}"}
     for uid, u in users_db.items():
         if u["email"].lower() == email.lower():
-            u["credits"] += TIER_CREDITS[tier]
-            u["tier"] = tier
+            u["credits"] += TIER_CREDITS[tier]; u["tier"] = tier
             u["credits_used"] = 0
-            u["paid_at"] = datetime.now(timezone.utc).isoformat()
-            print(f"✅ UPGRADED {email} → {tier} (+{TIER_CREDITS[tier]} credits)")
             return {"ok":True,"upgraded":True,"email":email,"tier":tier}
-
-    # Pre-register
     uid, _ = mk_user(email.lower(), email.split("@")[0], tier)
     users_db[uid]["credits"] = TIER_CREDITS[tier]
-    print(f"✅ PRE-REGISTERED {email} → {tier}")
     return {"ok":True,"upgraded":True,"created":True,"email":email,"tier":tier}
 
 @app.get("/nestlink/logs")
 async def nestlink_logs():
-    """See recent webhook calls."""
     if not WEBHOOK_LOG.exists(): return {"ok":True,"count":0,"entries":[]}
     lines = WEBHOOK_LOG.read_text().strip().split("\n")[-20:]
     return {"ok":True,"count":len(lines),
             "entries":[json.loads(l) for l in lines if l.strip()]}
 
-@app.get("/cfc/status")
-async def cfc_status_proxy():
-    if not COLAB_MODEL_URL: raise HTTPException(503, "CFC offline")
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.get(COLAB_MODEL_URL + "/cfc/status")
-    return r.json()
-
-@app.get("/cfc/active")
-async def cfc_active():
-    if not COLAB_MODEL_URL: return {"ok":True,"count":0,"agents":[]}
-    try:
-        async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get(COLAB_MODEL_URL + "/cfc/status")
-        d = r.json(); pr = d.get("predictors", {})
-        return {"ok":True,"count":len(pr),"agents":list(pr.keys())}
-    except Exception:
-        return {"ok":True,"count":0,"agents":[]}
-
-@app.post("/agent/run")
-async def agent_proxy(body: dict):
-    if not COLAB_MODEL_URL: raise HTTPException(503, "Local brain offline")
-    async with httpx.AsyncClient(timeout=300) as c:
-        r = await c.post(COLAB_MODEL_URL + "/agent/run", json=body)
-    return r.json()
-
-# ── NASA imagery — no API key required ──
-@app.get("/nasa/earth")
-async def nasa_earth():
-    """Latest full-Earth photo from DSCOVR satellite (NASA EPIC). No auth."""
-    try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get("https://epic.gsfc.nasa.gov/api/natural")
-        items = r.json()
-        if not items:
-            raise HTTPException(404, "No images available")
-        latest = items[0]
-        date_path = latest["date"].split(" ")[0].replace("-", "/")
-        img = (f"https://epic.gsfc.nasa.gov/archive/natural/{date_path}"
-               f"/png/{latest['image']}.png")
-        return {
-            "ok": True,
-            "date": latest["date"],
-            "caption": latest.get("caption", "Earth from DSCOVR"),
-            "image_url": img,
-            "thumbnail": img.replace(".png", ".jpg"),
-            "lat": latest["centroid_coordinates"]["lat"],
-            "lon": latest["centroid_coordinates"]["lon"],
-            "source": "https://epic.gsfc.nasa.gov/",
-        }
-    except Exception as e:
-        raise HTTPException(502, str(e))
-
-@app.get("/nasa/satellite")
-async def nasa_satellite(lat: float = -1.29, lon: float = 36.82):
-    """Latest satellite view near coordinates — NOAA GOES + NASA GIBS.
-    No API key needed. Returns tile URLs for the latest available frame."""
-    from datetime import datetime, timedelta, timezone
-    # GOES-East covers Africa at 30-min intervals. Use most recent past frame.
-    now = datetime.now(timezone.utc)
-    # Round down to nearest 10 min for GOES-East
-    frame = now.replace(minute=(now.minute // 10) * 10, second=0, microsecond=0)
-    # GOES-East static "latest" URL — always resolves to the newest frame
-    # instead of a timestamped file that may not exist yet.
-    goes_url = (
-        "https://cdn.star.nesdis.noaa.gov/GOES16/ABI/FD/GEOCOLOR/"
-        "1808x1808.jpg"
-    )
-
-    # NASA GIBS WMTS tile URL (MODIS/VIIRS) for the coordinates
-    gibs_url = (
-        f"https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/"
-        f"VIIRS_SNPP_CorrectedReflectance_TrueColor/default/"
-        f"{now.strftime('%Y-%m-%d')}/250m/"
-        f"{{TileMatrixSet}}/{{TileMatrix}}/{{TileRow}}/{{TileCol}}.jpg"
-    )
-
-    return {
-        "ok": True,
-        "frame_time": frame.isoformat(),
-        "lat": lat,
-        "lon": lon,
-        "goes_east_full_disk": goes_url,
-        "gibs_template": gibs_url,
-        "gibs_date": now.strftime("%Y-%m-%d"),
-        "description": (
-            f"Latest satellite imagery near ({lat:.2f}, {lon:.2f}). "
-            "GOES-East covers Africa every 10 minutes. "
-            "NASA GIBS provides daily global true-color imagery."
-        ),
-        "sources": [
-            "https://cdn.star.nesdis.noaa.gov/GOES16/ABI/FD/GEOCOLOR/",
-            "https://gibs.earthdata.nasa.gov/",
-            "https://epic.gsfc.nasa.gov/",
-        ],
-    }
-
-@app.get("/nasa/search")
-async def nasa_search(q: str = "Kenya"):
-    """Search NASA image library. No key needed."""
-    try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get("https://images-api.nasa.gov/search",
-                            params={"q": q, "media_type": "image", "page_size": 12})
-        data = r.json()
-        items = data.get("collection", {}).get("items", [])
-        results = []
-        for it in items[:12]:
-            d = it["data"][0]
-            link = it["links"][0]["href"] if it.get("links") else None
-            results.append({
-                "title": d.get("title"),
-                "description": (d.get("description") or "")[:200],
-                "nasa_id": d.get("nasa_id"),
-                "thumb": link,
-                "date": d.get("date_created"),
-            })
-        return {"ok": True, "count": len(results), "results": results}
-    except Exception as e:
-        raise HTTPException(502, str(e))
-
-from fastapi.responses import StreamingResponse
-
-@app.get("/img/proxy")
-async def img_proxy(url: str):
-    """Proxy any image through our server to bypass CORS.
-    Only allows NASA/NOAA/GIBS domains for safety."""
-    ALLOWED = (
-        "epic.gsfc.nasa.gov",
-        "cdn.star.nesdis.noaa.gov",
-        "gibs.earthdata.nasa.gov",
-        "images-api.nasa.gov",
-        "www.goes-r.gov",
-        "eoimages.gsfc.nasa.gov",
-    )
-    from urllib.parse import urlparse
-    host = urlparse(url).netloc
-    if not any(host.endswith(d) for d in ALLOWED):
-        raise HTTPException(403, f"Domain not allowed: {host}")
-    try:
-        async with httpx.AsyncClient(timeout=45) as c:
-            r = await c.get(url, headers={"User-Agent": "Imhotep/1.0"})
-        if r.status_code >= 300:
-            raise HTTPException(r.status_code, f"Upstream {r.status_code}")
-        ctype = r.headers.get("content-type", "image/jpeg")
-        return StreamingResponse(
-            iter([r.content]), media_type=ctype,
-            headers={"Cache-Control": "public, max-age=600",
-                     "Access-Control-Allow-Origin": "*"})
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(502, str(e))
-
 @app.get("/health")
-
-
 async def health():
-    return {"ok":True,"version":"3.2.0",
+    return {"ok":True,"version":"4.0.0",
             "model_configured":bool(NVIDIA_API_KEY),
-            "model":NVIDIA_MODEL if NVIDIA_API_KEY else "not-set",
             "colab_fallback_configured":bool(COLAB_MODEL_URL),
-            "weather_configured":bool(OPENWEATHER_KEY),
+            "weather_configured":True,
+            "weather_provider":"open-meteo (no key)",
             "nestlink_configured":bool(NESTLINK_API_KEY),
             "google_configured":bool(GOOGLE_CLIENT_ID),
             "kenya_counties":len(KENYA_COUNTIES),
-            "pricing_tiers":len(PRICES),
-            "adaptive_length":True,
+            "sheng_agent":True, "nasa_fires":True, "kenya_news":True,
+            "drought_data":True, "adaptive_length":True,
             "founder":"Samuel Kiragu"}
