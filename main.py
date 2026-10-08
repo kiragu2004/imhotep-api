@@ -656,16 +656,11 @@ async def nasa_satellite(lat: float = -1.29, lon: float = 36.82):
     now = datetime.now(timezone.utc)
     # Round down to nearest 10 min for GOES-East
     frame = now.replace(minute=(now.minute // 10) * 10, second=0, microsecond=0)
-    # GOES uses date-based paths
-    y = frame.strftime("%Y")
-    d = frame.strftime("%j")   # day of year
-    hh = frame.strftime("%H")
-    mm = frame.strftime("%M")
-
-    # GOES-East full disk — can be cropped via web viewer
+    # GOES-East static "latest" URL — always resolves to the newest frame
+    # instead of a timestamped file that may not exist yet.
     goes_url = (
-        f"https://cdn.star.nesdis.noaa.gov/GOES16/ABI/FD/GEOCOLOR/"
-        f"{y}{d}{hh}{mm}_GOES16-ABI-FD-GEOCOLOR-1808x1808.jpg"
+        "https://cdn.star.nesdis.noaa.gov/GOES16/ABI/FD/GEOCOLOR/"
+        "1808x1808.jpg"
     )
 
     # NASA GIBS WMTS tile URL (MODIS/VIIRS) for the coordinates
@@ -720,7 +715,41 @@ async def nasa_search(q: str = "Kenya"):
     except Exception as e:
         raise HTTPException(502, str(e))
 
+from fastapi.responses import StreamingResponse
+
+@app.get("/img/proxy")
+async def img_proxy(url: str):
+    """Proxy any image through our server to bypass CORS.
+    Only allows NASA/NOAA/GIBS domains for safety."""
+    ALLOWED = (
+        "epic.gsfc.nasa.gov",
+        "cdn.star.nesdis.noaa.gov",
+        "gibs.earthdata.nasa.gov",
+        "images-api.nasa.gov",
+        "www.goes-r.gov",
+        "eoimages.gsfc.nasa.gov",
+    )
+    from urllib.parse import urlparse
+    host = urlparse(url).netloc
+    if not any(host.endswith(d) for d in ALLOWED):
+        raise HTTPException(403, f"Domain not allowed: {host}")
+    try:
+        async with httpx.AsyncClient(timeout=45) as c:
+            r = await c.get(url, headers={"User-Agent": "Imhotep/1.0"})
+        if r.status_code >= 300:
+            raise HTTPException(r.status_code, f"Upstream {r.status_code}")
+        ctype = r.headers.get("content-type", "image/jpeg")
+        return StreamingResponse(
+            iter([r.content]), media_type=ctype,
+            headers={"Cache-Control": "public, max-age=600",
+                     "Access-Control-Allow-Origin": "*"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
 @app.get("/health")
+
 
 async def health():
     return {"ok":True,"version":"3.2.0",
