@@ -18,7 +18,7 @@ NESTLINK_WEBHOOK_SECRET = os.getenv("NESTLINK_WEBHOOK_SECRET", "imhotep-nestlink
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 CORS_ORIGINS     = [o.strip() for o in os.getenv("CORS_ORIGINS","*").split(",") if o.strip()]
 
-app = FastAPI(title="Imhotep", version="2.8.0")
+app = FastAPI(title="Imhotep", version="2.9.0")
 app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -48,13 +48,21 @@ def sys_prompt(a):
     p = PERSONAS.get(a, "a general assistant")
     return (f"You are Imhotep, built by Samuel Kiragu in Kenya. "
             f"You are the {a.upper()} agent — {p}.\n"
-            "1. 100-150 sentences MAX. Direct, sharp.\n"
+            "1. Answer in 3-5 sentences MAX. Direct, sharp.\n"
             "2. NEVER mention model/company names.\n"
             "3. If asked: 'I run on Imhotep — built by Samuel Kiragu.'\n"
             "4. Cite facts as [source: URL].\n")
 
 users_db, chat_db = {}, {}
-TIER = {"guest":3,"free":3,"starter":3,"weekly":99,"monthly":299,"yearly":4999}
+# FIXED: credits granted per tier (not KES prices)
+TIER = {
+    "guest":   3,
+    "free":    3,
+    "starter": 3,
+    "weekly":  10000,
+    "monthly": 10000,
+    "yearly":  10000,
+}
 
 class ChatIn(BaseModel):
     prompt: str
@@ -323,6 +331,20 @@ async def cfc_status_proxy():
         r = await c.get(COLAB_MODEL_URL + "/cfc/status")
     return r.json()
 
+@app.get("/cfc/active")
+async def cfc_active():
+    """Public CFC count for the website pill."""
+    if not COLAB_MODEL_URL:
+        return {"ok": True, "count": 0, "agents": []}
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(COLAB_MODEL_URL + "/cfc/status")
+        d = r.json()
+        predictors = d.get("predictors", {})
+        return {"ok": True, "count": len(predictors), "agents": list(predictors.keys())}
+    except Exception:
+        return {"ok": True, "count": 0, "agents": []}
+
 @app.post("/agent/run")
 async def agent_proxy(body: dict):
     if not COLAB_MODEL_URL: raise HTTPException(503, "Local brain offline")
@@ -332,7 +354,7 @@ async def agent_proxy(body: dict):
 
 @app.get("/health")
 async def health():
-    return {"ok":True,"version":"2.8.0",
+    return {"ok":True,"version":"2.9.0",
             "model_configured":bool(NVIDIA_API_KEY),
             "model":NVIDIA_MODEL if NVIDIA_API_KEY else "not-set",
             "colab_fallback_configured":bool(COLAB_MODEL_URL),
