@@ -381,8 +381,16 @@ async def nestlink_webhook(request: Request):
         payload = {}
 
     # NestLink variants — accept multiple field names
-    email = (payload.get("email") or payload.get("customer_email") or
-             payload.get("customer", {}).get("email") if isinstance(payload.get("customer"), dict) else None)
+    email = payload.get("email") or payload.get("customer_email")
+    if not email and isinstance(payload.get("customer"), dict):
+        email = payload["customer"].get("email")
+    if not email:
+        # Also check nested data/transaction objects
+        for key in ("data", "transaction", "payment"):
+            sub = payload.get(key)
+            if isinstance(sub, dict):
+                email = sub.get("email") or sub.get("customer_email")
+                if email: break
     ref   = payload.get("reference") or payload.get("api_ref") or payload.get("external_reference") or ""
     status = (payload.get("status") or payload.get("payment_status") or
               payload.get("transaction_status") or "").lower()
