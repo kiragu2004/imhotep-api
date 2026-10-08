@@ -174,8 +174,7 @@ async def weather_ep(body: dict):
 
 async def _nvidia(msgs, temp):
     body = {"model":NVIDIA_MODEL,"messages":msgs,"temperature":temp,
-            "top_p":0.95,"max_tokens":1024,
-            "extra_body":{"chat_template_kwargs":{"enable_thinking":False}}}
+            "top_p":0.95,"max_tokens":1024}
     async with httpx.AsyncClient(timeout=90) as c:
         r = await c.post(NVIDIA_URL,
             headers={"Authorization":f"Bearer {NVIDIA_API_KEY}",
