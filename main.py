@@ -620,7 +620,108 @@ async def agent_proxy(body: dict):
         r = await c.post(COLAB_MODEL_URL + "/agent/run", json=body)
     return r.json()
 
+# ── NASA imagery — no API key required ──
+@app.get("/nasa/earth")
+async def nasa_earth():
+    """Latest full-Earth photo from DSCOVR satellite (NASA EPIC). No auth."""
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get("https://epic.gsfc.nasa.gov/api/natural")
+        items = r.json()
+        if not items:
+            raise HTTPException(404, "No images available")
+        latest = items[0]
+        date_path = latest["date"].split(" ")[0].replace("-", "/")
+        img = (f"https://epic.gsfc.nasa.gov/archive/natural/{date_path}"
+               f"/png/{latest['image']}.png")
+        return {
+            "ok": True,
+            "date": latest["date"],
+            "caption": latest.get("caption", "Earth from DSCOVR"),
+            "image_url": img,
+            "thumbnail": img.replace(".png", ".jpg"),
+            "lat": latest["centroid_coordinates"]["lat"],
+            "lon": latest["centroid_coordinates"]["lon"],
+            "source": "https://epic.gsfc.nasa.gov/",
+        }
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+@app.get("/nasa/satellite")
+async def nasa_satellite(lat: float = -1.29, lon: float = 36.82):
+    """Latest satellite view near coordinates — NOAA GOES + NASA GIBS.
+    No API key needed. Returns tile URLs for the latest available frame."""
+    from datetime import datetime, timedelta, timezone
+    # GOES-East covers Africa at 30-min intervals. Use most recent past frame.
+    now = datetime.now(timezone.utc)
+    # Round down to nearest 10 min for GOES-East
+    frame = now.replace(minute=(now.minute // 10) * 10, second=0, microsecond=0)
+    # GOES uses date-based paths
+    y = frame.strftime("%Y")
+    d = frame.strftime("%j")   # day of year
+    hh = frame.strftime("%H")
+    mm = frame.strftime("%M")
+
+    # GOES-East full disk — can be cropped via web viewer
+    goes_url = (
+        f"https://cdn.star.nesdis.noaa.gov/GOES16/ABI/FD/GEOCOLOR/"
+        f"{y}{d}{hh}{mm}_GOES16-ABI-FD-GEOCOLOR-1808x1808.jpg"
+    )
+
+    # NASA GIBS WMTS tile URL (MODIS/VIIRS) for the coordinates
+    gibs_url = (
+        f"https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/"
+        f"VIIRS_SNPP_CorrectedReflectance_TrueColor/default/"
+        f"{now.strftime('%Y-%m-%d')}/250m/"
+        f"{{TileMatrixSet}}/{{TileMatrix}}/{{TileRow}}/{{TileCol}}.jpg"
+    )
+
+    return {
+        "ok": True,
+        "frame_time": frame.isoformat(),
+        "lat": lat,
+        "lon": lon,
+        "goes_east_full_disk": goes_url,
+        "gibs_template": gibs_url,
+        "gibs_date": now.strftime("%Y-%m-%d"),
+        "description": (
+            f"Latest satellite imagery near ({lat:.2f}, {lon:.2f}). "
+            "GOES-East covers Africa every 10 minutes. "
+            "NASA GIBS provides daily global true-color imagery."
+        ),
+        "sources": [
+            "https://cdn.star.nesdis.noaa.gov/GOES16/ABI/FD/GEOCOLOR/",
+            "https://gibs.earthdata.nasa.gov/",
+            "https://epic.gsfc.nasa.gov/",
+        ],
+    }
+
+@app.get("/nasa/search")
+async def nasa_search(q: str = "Kenya"):
+    """Search NASA image library. No key needed."""
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get("https://images-api.nasa.gov/search",
+                            params={"q": q, "media_type": "image", "page_size": 12})
+        data = r.json()
+        items = data.get("collection", {}).get("items", [])
+        results = []
+        for it in items[:12]:
+            d = it["data"][0]
+            link = it["links"][0]["href"] if it.get("links") else None
+            results.append({
+                "title": d.get("title"),
+                "description": (d.get("description") or "")[:200],
+                "nasa_id": d.get("nasa_id"),
+                "thumb": link,
+                "date": d.get("date_created"),
+            })
+        return {"ok": True, "count": len(results), "results": results}
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
 @app.get("/health")
+
 async def health():
     return {"ok":True,"version":"3.2.0",
             "model_configured":bool(NVIDIA_API_KEY),
