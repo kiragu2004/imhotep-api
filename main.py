@@ -1,3 +1,20 @@
+@app.get("/drought/{county}")
+async def drought_status(county: str):
+    """Fetch live NDMA drought phase for a Kenyan county."""
+    # This is the public API endpoint for the wapimaji-mcp server
+    api_url = f"https://api.wapimaji.dev/drought/{county.lower()}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(api_url)
+        if r.status_code != 200:
+            return {"ok": False, "error": f"No drought data for '{county}'"}
+        data = r.json()
+        # The exact response format may vary; assume a JSON like:
+        # {"phase": 3, "label": "Alarm", "rainfall_deficit": 30}
+        return {"ok": True, "county": county.title(), **data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 
 import os, re, time, secrets, hmac, hashlib, json, pathlib
 import xml.etree.ElementTree as ET
