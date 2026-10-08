@@ -1,11 +1,12 @@
 
-import os, re, time, secrets, hmac, hashlib, json, pathlib, xml.etree.ElementTree as ET
+import os, re, time, secrets, hmac, hashlib, json, pathlib
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 import httpx, jwt
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, PlainTextResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr
 
 SECRET_KEY       = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
@@ -13,19 +14,19 @@ NVIDIA_API_KEY   = os.getenv("NVIDIA_API_KEY", "")
 NVIDIA_MODEL     = os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b")
 NVIDIA_URL       = "https://integrate.api.nvidia.com/v1/chat/completions"
 COLAB_MODEL_URL  = os.getenv("COLAB_MODEL_URL", "").rstrip("/")
-OPENWEATHER_KEY  = os.getenv("OPENWEATHER_API_KEY", "")
 NESTLINK_API_KEY = os.getenv("NESTLINK_API_KEY", "")
 NESTLINK_WEBHOOK_SECRET = os.getenv("NESTLINK_WEBHOOK_SECRET", "imhotep-nestlink-2026")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 CORS_ORIGINS     = [o.strip() for o in os.getenv("CORS_ORIGINS","*").split(",") if o.strip()]
 
-app = FastAPI(title="Imhotep", version="4.0.0")
+app = FastAPI(title="Imhotep", version="5.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
 LOG_DIR = pathlib.Path("/tmp/imhotep"); LOG_DIR.mkdir(exist_ok=True)
 WEBHOOK_LOG = LOG_DIR / "webhooks.jsonl"
 
+# ── Persona leak scrubber ──
 _LEAK = [(r"\bNVIDIA\s+NIM\b","Imhotep"),(r"\bNVIDIA\b","Imhotep"),
          (r"\bNemotron[\w\-\.]*\b","Imhotep"),(r"\bNIM\b","Imhotep"),
          (r"\bQwen[\w\-\.]*\b","Imhotep"),(r"\bDeepSeek[\w\-]*\b","Imhotep"),
@@ -38,7 +39,39 @@ def scrub(t):
     return t
 
 # ═══════════════════════════════════════════════════════════════
-# PERSONAS incl. SHENG
+# SHENG DICTIONARY — real words the model can use
+# ═══════════════════════════════════════════════════════════════
+SHENG_DICT = """
+SHENG VOCABULARY — use these accurately:
+PEOPLE: chali/msee=m guy, demu/msupa/chica=girl, beshte/arif=friend,
+        mbogi=group, mathee=mother, buda/mzae=father, karao/makarao=police
+MONEY: doo/chapaa/mula=money, ashu/kinde=10/-, blue/mbao=20/-, soo=100/-,
+       rwabe=200/-, punch=500/-, thao=1000/-
+ACTIONS: bonga=talk, dishi=eat, doro=sleep, banjuka=dance, sota=broke,
+         cheza chini=chill/low profile, rada=pay attention
+GREETINGS: sasa=hey, niaje=what's up, mambo=how are things, poa/fiti/safi=cool,
+           sema=speak, radudua=what's up (slang)
+PLACES: mtaa=neighborhood, hao=house, ocha=upcountry, mat/nganya=matatu,
+        dinga/moti=car, Kanairo=Nairobi
+OTHER: noma=trouble/impressive, mbuyu=old man, masa=friend, keja=house,
+       mzito=heavy/serious, bazenga=respected man
+"""
+
+SHENG_GREETINGS = ("sasa","niaje","mambo","marada","radudua","sema","bonga","uko poa","uko aje")
+
+def is_sheng_query(prompt: str) -> bool:
+    p = prompt.lower()
+    if any(g in p for g in SHENG_GREETINGS): return True
+    # Also check for common sheng words
+    sheng_words = ("chapaa","doo","mula","beshte","mbogi","demu","chali","msee",
+                   "sota","dishi","doro","banjuka","ocha","mtaa","mathee","buda",
+                   "thao","soo","rwabe","punch")
+    if any(w in p for w in sheng_words): return True
+    if "sheng" in p or "kiswahili" in p or "swahili" in p: return True
+    return False
+
+# ═══════════════════════════════════════════════════════════════
+# PERSONAS
 # ═══════════════════════════════════════════════════════════════
 PERSONAS = {
     "generalist":"a broad Kenyan assistant","scientist":"a rigorous scientist",
@@ -50,31 +83,13 @@ PERSONAS = {
     "engineer":"an engineer","agronomist":"an agronomist","inventor":"an inventor",
     "civic":"a civic analyst","marketer":"a marketer","media":"a media producer",
     "activist":"an activist","tongue-twister":"a playful tongue-twister agent",
-    "sheng":"a fun Kenyan who speaks fluent Sheng (Nairobi street slang)",
+    "sheng":"a fluent Sheng speaker from Nairobi streets",
 }
 
-SHENG_GREETINGS = [
-    "Sasa!", "Niaje?", "Poa?", "Fiti!", "Radua!", "Uko poa?",
-    "Mambo?", "Sema!", "Niaje msee?", "Aki niaje!",
-]
-SHENG_REPLIES = {
-    "sasa":"Poa sana!", "niaje":"Fiti kabisa!", "mambo":"Poa!",
-    "uko poa":"Niko fiti!", "radua":"Radua!",
-}
-
-def is_sheng_query(prompt: str) -> bool:
-    p = prompt.lower()
-    keys = ("sheng","kiswahili","swahili","kenyan slang","nairobi slang",
-            "sasa","niaje","mambo","radudua","poa")
-    return any(k in p for k in keys)
-
-# ═══════════════════════════════════════════════════════════════
-# ADAPTIVE LENGTH (learning vs casual)
-# ═══════════════════════════════════════════════════════════════
 LEARN_SIGNALS = (
     "teach","explain","how does","how do","why does","why do","tutorial",
     "step by step","help me learn","walk me through","show me how","example",
-    "code","function","class","api","algorithm","debug","error","python",
+    "code","function","class","algorithm","debug","error","python",
     "javascript","rust","go","sql","react","explain like i'm","eli5",
     "in detail","deep dive","break it down","study","understand","learn",
     "homework","assignment","project","guide","documentation",
@@ -101,14 +116,21 @@ def sys_prompt(agent: str, prompt: str = ""):
         "GPT, Claude, Gemini, OpenAI, Meta, or any model/company name.\n"
         "  • Speak in first person as Imhotep.\n"
     )
+
     if agent == "sheng":
-        identity += (
-            "\nSHENG MODE: Reply in Sheng (Nairobi street slang) mixed with "
-            "Kiswahili and English. Use words like: sasa, niaje, poa, fiti, "
-            "msee, mbuyu, masa, chapaa, keja, ocha, Kanairo, mzito, bazenga, "
-            "radudua, sema. Keep it friendly and street-smart. "
-            "If user seems confused, translate briefly in English."
+        return (
+            identity + "\n" + SHENG_DICT + "\n"
+            "SHENG MODE — CRITICAL RULES:\n"
+            "1. Reply ENTIRELY in Sheng mixed with Kiswahili and English.\n"
+            "2. Use the real Sheng vocabulary above. Do not invent words.\n"
+            "3. Greet with: sasa, niaje, mambo, radudua, sema.\n"
+            "4. Example reply style: 'Sasa msee! Niaje? Mi ni fiti, poa tu. "
+            "Wewe uko aje leo?'\n"
+            "5. If the user writes in English, still reply in Sheng with English "
+            "explanation only if they look confused.\n"
+            "6. Never break character. Never say you are an AI.\n"
         )
+
     if learning:
         style = ("RESPONSE STYLE — learning/coding question. Reply structured:\n"
                  "  1. Direct 1-2 sentence summary FIRST.\n"
@@ -212,10 +234,9 @@ async def google(b: GoogleIn):
     return {"ok":True,"user_id":u,"token":issue(u),"user":users_db[u]}
 
 # ═══════════════════════════════════════════════════════════════
-# WEATHER — Open-Meteo (no key, works with GPS or city name)
+# WEATHER — Open-Meteo (no key) + OpenWeather fallback if key set
 # ═══════════════════════════════════════════════════════════════
 def classify_wx(temp, code):
-    """code = WMO weather code from Open-Meteo"""
     try: c = int(code)
     except: c = 0
     if c in (0,1): e, l = "☀️", "Clear"
@@ -228,7 +249,6 @@ def classify_wx(temp, code):
     elif c in (80,81,82): e, l = "🌧️", "Showers"
     elif c in (95,96,99): e, l = "⛈️", "Thunderstorm"
     else: e, l = "🌤️", "Fair"
-
     if temp >= 35: f = "scorching hot 🥵🔥"
     elif temp >= 30: f = "very hot 🥵"
     elif temp >= 26: f = "hot 🔥"
@@ -238,110 +258,133 @@ def classify_wx(temp, code):
     else: f = "very cold 🥶"
     return {"emoji":e, "condition_label":l, "feel":f}
 
+async def _geocode_city(city: str):
+    """Resolve a Kenyan city name to lat/lon via Open-Meteo geocoder."""
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.get("https://geocoding-api.open-meteo.com/v1/search",
+                        params={"name": city, "count": 1, "language": "en"})
+    g = r.json()
+    if not g.get("results"):
+        return None, None, None
+    hit = g["results"][0]
+    return (hit.get("latitude"), hit.get("longitude"),
+            hit.get("name") or city)
+
 @app.post("/weather")
 async def weather_ep(body: dict):
-    """Open-Meteo — no API key required. Accepts lat/lon OR city."""
-    lat, lon, city = body.get("lat"), body.get("lon"), body.get("city")
+    """Open-Meteo — no API key needed. Accepts {lat,lon} OR {city}."""
+    lat = body.get("lat"); lon = body.get("lon"); city = body.get("city")
 
-    # If only city given, geocode it via Open-Meteo geocoding API
+    # If city given and coords missing, geocode
     if (lat is None or lon is None) and city:
-        try:
-            async with httpx.AsyncClient(timeout=15) as c:
-                r = await c.get("https://geocoding-api.open-meteo.com/v1/search",
-                                params={"name": city, "count": 1, "language": "en"})
-            g = r.json()
-            if g.get("results"):
-                lat = g["results"][0]["latitude"]
-                lon = g["results"][0]["longitude"]
-                city = g["results"][0]["name"]
-            else:
-                raise HTTPException(404, f"City '{city}' not found")
-        except HTTPException: raise
-        except Exception as e: raise HTTPException(502, f"Geocoding failed: {e}")
+        la, lo, resolved = await _geocode_city(city)
+        if la is None:
+            raise HTTPException(404, f"City '{city}' not found")
+        lat, lon, city = la, lo, resolved
 
     if lat is None or lon is None:
         raise HTTPException(400, "Provide lat+lon or city")
 
+    # Fetch current weather
     try:
         async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get("https://api.open-meteo.com/v1/forecast",
-                params={"latitude":lat, "longitude":lon,
-                        "current":"temperature_2m,relative_humidity_2m,apparent_temperature,"
-                                  "weather_code,wind_speed_10m,precipitation",
-                        "timezone":"auto"})
-        d = r.json()
-        cur = d.get("current", {})
-        temp = round(cur.get("temperature_2m", 0))
-        feels = round(cur.get("apparent_temperature", temp))
-        code = cur.get("weather_code", 0)
-        cls = classify_wx(temp, code)
-        return {"ok":True, "temp":temp, "feels_like":feels,
-                "condition": cls["condition_label"],
-                "description": cls["condition_label"],
-                "humidity": cur.get("relative_humidity_2m"),
-                "wind": cur.get("wind_speed_10m"),
-                "city": city or f"{lat:.2f},{lon:.2f}",
-                "country": "",
-                **cls,
-                "source": "open-meteo.com"}
+            r = await c.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": lat,
+                    "longitude": lon,
+                    "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m",
+                    "timezone": "auto",
+                })
+        data = r.json()
     except Exception as e:
-        raise HTTPException(502, str(e))
+        raise HTTPException(502, f"Open-Meteo error: {e}")
+
+    cur = data.get("current") or {}
+    temp_raw = cur.get("temperature_2m")
+    if temp_raw is None:
+        # Try OpenWeather if key set
+        owm_key = os.getenv("OPENWEATHER_API_KEY", "")
+        if owm_key:
+            async with httpx.AsyncClient(timeout=15) as c:
+                rr = await c.get("https://api.openweathermap.org/data/2.5/weather",
+                                 params={"lat": lat, "lon": lon,
+                                         "appid": owm_key, "units": "metric"})
+            d = rr.json()
+            if "main" in d:
+                temp = round(d["main"]["temp"])
+                cls = classify_wx(temp, d.get("weather", [{}])[0].get("id", 800))
+                return {"ok":True, "temp":temp,
+                        "feels_like":round(d["main"].get("feels_like", temp)),
+                        "humidity": d["main"].get("humidity"),
+                        "wind": d.get("wind", {}).get("speed"),
+                        "city": d.get("name") or city or f"{lat:.2f},{lon:.2f}",
+                        "country": d.get("sys", {}).get("country",""),
+                        **cls, "source":"openweathermap"}
+        raise HTTPException(502, "Weather provider returned no data")
+
+    temp = round(temp_raw)
+    code = cur.get("weather_code", 0)
+    cls = classify_wx(temp, code)
+    return {
+        "ok": True,
+        "temp": temp,
+        "feels_like": round(cur.get("apparent_temperature", temp)),
+        "condition": cls["condition_label"],
+        "description": cls["condition_label"],
+        "humidity": cur.get("relative_humidity_2m"),
+        "wind": cur.get("wind_speed_10m"),
+        "city": city or f"{lat:.2f},{lon:.2f}",
+        "country": "",
+        **cls,
+        "source": "open-meteo.com",
+    }
 
 # ═══════════════════════════════════════════════════════════════
-# NASA FIRMS — active fires (public CSV, no key)
+# NASA FIRMS — Kenya fires (public CSV, no key)
 # ═══════════════════════════════════════════════════════════════
 @app.get("/fires/kenya")
 async def fires_kenya(days: int = 1):
-    """Active fire detections in Kenya (last N days, max 2). NASA FIRMS public CSV."""
-    days = min(max(days, 1), 2)
-    # FIRMS public CSV directory - no key needed for global 24h/48h/7d files
+    """Active fire detections in Kenya. NASA FIRMS public CSV, no key."""
     urls = [
-        "https://firms.modaps.eosdis.nasa.gov/data/active_fire/suomi-npp-viirs-c2/csv/"
-        "SUOMI_VIIRS_C2_Global_24h.csv",
-        "https://firms.modaps.eosdis.nasa.gov/data/active_fire/modis-c6.1/csv/"
-        "MODIS_C6_1_Global_24h.csv",
+        "https://firms.modaps.eosdis.nasa.gov/data/active_fire/suomi-npp-viirs-c2/csv/SUOMI_VIIRS_C2_Global_24h.csv",
+        "https://firms.modaps.eosdis.nasa.gov/data/active_fire/modis-c6.1/csv/MODIS_C6_1_Global_24h.csv",
     ]
-    try:
-        fires = []
-        async with httpx.AsyncClient(timeout=45) as c:
-            for url in urls:
-                try:
-                    r = await c.get(url)
-                    if r.status_code >= 300: continue
-                    lines = r.text.strip().split("\n")
-                    if not lines: continue
-                    header = lines[0].split(",")
-                    for line in lines[1:]:
-                        parts = line.split(",")
-                        if len(parts) < len(header): continue
-                        row = dict(zip(header, parts))
-                        try:
-                            la = float(row.get("latitude", 0))
-                            lo = float(row.get("longitude", 0))
-                        except: continue
-                        # Kenya bounds
-                        if -5 <= la <= 6 and 33 <= lo <= 42:
-                            fires.append({
-                                "lat": la, "lon": lo,
-                                "brightness": row.get("bright_ti4") or row.get("brightness"),
-                                "confidence": row.get("confidence"),
-                                "date": row.get("acq_date"),
-                                "time": row.get("acq_time"),
-                                "satellite": row.get("satellite"),
-                                "daynight": row.get("daynight"),
-                            })
-                except Exception: continue
-        return {"ok": True, "count": len(fires),
-                "fires": fires[:50], "source": "NASA FIRMS"}
-    except Exception as e:
-        raise HTTPException(502, str(e))
+    fires = []
+    async with httpx.AsyncClient(timeout=45) as c:
+        for url in urls:
+            try:
+                r = await c.get(url)
+                if r.status_code >= 300: continue
+                lines = r.text.strip().split("\n")
+                if not lines: continue
+                header = lines[0].split(",")
+                for line in lines[1:]:
+                    parts = line.split(",")
+                    if len(parts) < len(header): continue
+                    row = dict(zip(header, parts))
+                    try:
+                        la = float(row.get("latitude", 0))
+                        lo = float(row.get("longitude", 0))
+                    except: continue
+                    if -5 <= la <= 6 and 33 <= lo <= 42:
+                        fires.append({
+                            "lat": la, "lon": lo,
+                            "brightness": row.get("bright_ti4") or row.get("brightness"),
+                            "confidence": row.get("confidence"),
+                            "date": row.get("acq_date"),
+                            "time": row.get("acq_time"),
+                            "satellite": row.get("satellite"),
+                        })
+            except Exception: continue
+    return {"ok": True, "count": len(fires),
+            "fires": fires[:50], "source": "NASA FIRMS"}
 
 # ═══════════════════════════════════════════════════════════════
-# KENYA NEWS — Standard Media RSS (no key)
+# Kenya news (Standard RSS, no key)
 # ═══════════════════════════════════════════════════════════════
 @app.get("/news/kenya")
 async def news_kenya(limit: int = 10):
-    """Latest Kenya headlines from Standard Media RSS. No API key."""
     url = "https://www.standardmedia.co.ke/rss/headlines.php"
     try:
         async with httpx.AsyncClient(timeout=20) as c:
@@ -351,12 +394,12 @@ async def news_kenya(limit: int = 10):
         root = ET.fromstring(r.text)
         items = []
         for item in root.findall(".//item")[:limit]:
-            title = item.findtext("title", "").strip()
-            link  = item.findtext("link", "").strip()
-            desc  = item.findtext("description", "").strip()
-            pub   = item.findtext("pubDate", "")
-            items.append({"title": title, "link": link,
-                          "description": desc[:250], "published": pub})
+            items.append({
+                "title": (item.findtext("title") or "").strip(),
+                "link": (item.findtext("link") or "").strip(),
+                "description": (item.findtext("description") or "").strip()[:250],
+                "published": item.findtext("pubDate") or "",
+            })
         return {"ok": True, "count": len(items), "items": items,
                 "source": "standardmedia.co.ke/rss"}
     except HTTPException: raise
@@ -364,89 +407,71 @@ async def news_kenya(limit: int = 10):
         raise HTTPException(502, str(e))
 
 # ═══════════════════════════════════════════════════════════════
-# KENYA DROUGHT — NDMA phase (info from public sources)
+# Drought data (approximate NDMA phases)
 # ═══════════════════════════════════════════════════════════════
 DROUGHT_DATA = {
-    # Approximate NDMA drought phase per county (last release)
-    # 1=Minimal, 2=Alert, 3=Alarm, 4=Emergency, 5=Famine
-    "turkana": 3, "marsabit": 3, "mandera": 2, "wajir": 2, "garissa": 2,
-    "isiolo": 2, "samburu": 3, "west pokot": 2, "baringo": 2, "laikipia": 1,
-    "kitui": 2, "makueni": 1, "kilifi": 2, "tana river": 2, "lamu": 1,
-    "mombasa": 1, "kwale": 1, "taita taveta": 1, "narok": 1, "kajiado": 1,
-    "nairobi": 1, "kiambu": 1, "murang'a": 1, "nyeri": 1, "kirinyaga": 1,
+    "turkana":3,"marsabit":3,"mandera":2,"wajir":2,"garissa":2,
+    "isiolo":2,"samburu":3,"west pokot":2,"baringo":2,"laikipia":1,
+    "kitui":2,"makueni":1,"kilifi":2,"tana river":2,"lamu":1,
+    "mombasa":1,"kwale":1,"taita taveta":1,"narok":1,"kajiado":1,
+    "nairobi":1,"kiambu":1,"murang'a":1,"nyeri":1,"kirinyaga":1,
 }
 @app.get("/drought/{county}")
 async def drought_status(county: str):
-    """Approximate NDMA drought phase for a Kenyan county."""
     key = county.strip().lower()
     phase = DROUGHT_DATA.get(key)
     if phase is None:
-        return {"ok": False, "error": f"No drought data for '{county}'",
-                "hint": "Try: Turkana, Marsabit, Mandera, Garissa, Kitui, Nairobi"}
+        return {"ok": False, "error": f"No drought data for '{county}'"}
     labels = {1:"Minimal", 2:"Alert", 3:"Alarm", 4:"Emergency", 5:"Famine"}
     return {"ok": True, "county": county.title(),
             "phase": phase, "label": labels[phase],
-            "source": "NDMA (approx — verify at ndma.go.ke)"}
+            "source": "NDMA (approx)"}
 
 # ═══════════════════════════════════════════════════════════════
-# NASA SATELLITES + IMAGE SEARCH (no keys)
+# NASA satellites + images
 # ═══════════════════════════════════════════════════════════════
 @app.get("/nasa/earth")
 async def nasa_earth():
-    try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get("https://epic.gsfc.nasa.gov/api/natural")
-        items = r.json()
-        if not items: raise HTTPException(404, "No images available")
-        latest = items[0]
-        date_path = latest["date"].split(" ")[0].replace("-", "/")
-        img = (f"https://epic.gsfc.nasa.gov/archive/natural/{date_path}"
-               f"/png/{latest['image']}.png")
-        return {"ok": True, "date": latest["date"],
-                "caption": latest.get("caption", "Earth from DSCOVR"),
-                "image_url": img,
-                "lat": latest["centroid_coordinates"]["lat"],
-                "lon": latest["centroid_coordinates"]["lon"],
-                "source": "https://epic.gsfc.nasa.gov/"}
-    except Exception as e:
-        raise HTTPException(502, str(e))
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get("https://epic.gsfc.nasa.gov/api/natural")
+    items = r.json()
+    if not items: raise HTTPException(404, "No EPIC images available")
+    latest = items[0]
+    date_path = latest["date"].split(" ")[0].replace("-", "/")
+    img = f"https://epic.gsfc.nasa.gov/archive/natural/{date_path}/png/{latest['image']}.png"
+    return {"ok": True, "date": latest["date"],
+            "caption": latest.get("caption", "Earth from DSCOVR"),
+            "image_url": img,
+            "lat": latest["centroid_coordinates"]["lat"],
+            "lon": latest["centroid_coordinates"]["lon"],
+            "source": "https://epic.gsfc.nasa.gov/"}
 
 @app.get("/nasa/satellite")
 async def nasa_satellite(lat: float = -1.29, lon: float = 36.82):
-    """Live satellite URLs — GOES-East always-latest + GIBS tiles. No key."""
     goes_url = "https://cdn.star.nesdis.noaa.gov/GOES16/ABI/FD/GEOCOLOR/1808x1808.jpg"
     now = datetime.now(timezone.utc)
-    gibs_url = (f"https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/"
-                f"VIIRS_SNPP_CorrectedReflectance_TrueColor/default/"
-                f"{now.strftime('%Y-%m-%d')}/250m/"
-                f"{{TileMatrixSet}}/{{TileMatrix}}/{{TileRow}}/{{TileCol}}.jpg")
-    return {"ok": True, "frame_time": now.isoformat(), "lat": lat, "lon": lon,
+    return {"ok": True, "frame_time": now.isoformat(),
+            "lat": lat, "lon": lon,
             "goes_east_full_disk": goes_url,
-            "gibs_template": gibs_url,
             "gibs_date": now.strftime("%Y-%m-%d"),
-            "sources": ["cdn.star.nesdis.noaa.gov",
-                        "gibs.earthdata.nasa.gov",
-                        "epic.gsfc.nasa.gov"]}
+            "sources": ["cdn.star.nesdis.noaa.gov","gibs.earthdata.nasa.gov","epic.gsfc.nasa.gov"]}
 
 @app.get("/nasa/search")
 async def nasa_search(q: str = "Kenya"):
-    try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get("https://images-api.nasa.gov/search",
-                            params={"q": q, "media_type": "image", "page_size": 12})
-        data = r.json()
-        items = data.get("collection", {}).get("items", [])
-        results = []
-        for it in items[:12]:
-            d = it["data"][0]
-            link = it["links"][0]["href"] if it.get("links") else None
-            results.append({"title": d.get("title"),
-                            "description": (d.get("description") or "")[:200],
-                            "nasa_id": d.get("nasa_id"), "thumb": link,
-                            "date": d.get("date_created")})
-        return {"ok": True, "count": len(results), "results": results}
-    except Exception as e:
-        raise HTTPException(502, str(e))
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get("https://images-api.nasa.gov/search",
+                        params={"q": q, "media_type": "image", "page_size": 12})
+    data = r.json()
+    items = data.get("collection", {}).get("items", [])
+    results = []
+    for it in items[:12]:
+        d = it["data"][0]
+        link = it["links"][0]["href"] if it.get("links") else None
+        results.append({"title": d.get("title"),
+                        "description": (d.get("description") or "")[:200],
+                        "nasa_id": d.get("nasa_id"),
+                        "thumb": link, "date": d.get("date_created")})
+    return {"ok": True, "count": len(results), "results": results}
 
 @app.get("/img/proxy")
 async def img_proxy(url: str):
@@ -456,55 +481,50 @@ async def img_proxy(url: str):
     host = urlparse(url).netloc
     if not any(host.endswith(d) for d in ALLOWED):
         raise HTTPException(403, f"Domain not allowed: {host}")
-    try:
-        async with httpx.AsyncClient(timeout=45) as c:
-            r = await c.get(url, headers={"User-Agent": "Imhotep/1.0"})
-        if r.status_code >= 300: raise HTTPException(r.status_code, "Upstream failed")
-        return StreamingResponse(iter([r.content]),
-            media_type=r.headers.get("content-type","image/jpeg"),
-            headers={"Cache-Control": "public, max-age=600",
-                     "Access-Control-Allow-Origin": "*"})
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(502, str(e))
+    async with httpx.AsyncClient(timeout=45) as c:
+        r = await c.get(url, headers={"User-Agent": "Imhotep/1.0"})
+    if r.status_code >= 300:
+        raise HTTPException(r.status_code, "Upstream failed")
+    return StreamingResponse(iter([r.content]),
+        media_type=r.headers.get("content-type","image/jpeg"),
+        headers={"Cache-Control": "public, max-age=600",
+                 "Access-Control-Allow-Origin": "*"})
 
 # ═══════════════════════════════════════════════════════════════
-# KENYA COUNTIES
+# Kenya counties
 # ═══════════════════════════════════════════════════════════════
 KENYA_COUNTIES = {
-    "mombasa":{"code":"001","capital":"Mombasa"}, "kwale":{"code":"002","capital":"Kwale"},
-    "kilifi":{"code":"003","capital":"Kilifi"}, "tana river":{"code":"004","capital":"Hola"},
-    "lamu":{"code":"005","capital":"Lamu"}, "taita taveta":{"code":"006","capital":"Wundanyi"},
-    "garissa":{"code":"007","capital":"Garissa"}, "wajir":{"code":"008","capital":"Wajir"},
-    "mandera":{"code":"009","capital":"Mandera"}, "marsabit":{"code":"010","capital":"Marsabit"},
-    "isiolo":{"code":"011","capital":"Isiolo"}, "meru":{"code":"012","capital":"Meru"},
-    "tharaka-nithi":{"code":"013","capital":"Chuka"}, "embu":{"code":"014","capital":"Embu"},
-    "kitui":{"code":"015","capital":"Kitui"}, "machakos":{"code":"016","capital":"Machakos"},
-    "makueni":{"code":"017","capital":"Wote"}, "nyandarua":{"code":"018","capital":"Ol Kalou"},
-    "nyeri":{"code":"019","capital":"Nyeri"}, "kirinyaga":{"code":"020","capital":"Kerugoya"},
-    "murang'a":{"code":"021","capital":"Murang'a"}, "kiambu":{"code":"022","capital":"Kiambu"},
-    "turkana":{"code":"023","capital":"Lodwar"}, "west pokot":{"code":"024","capital":"Kapenguria"},
-    "samburu":{"code":"025","capital":"Maralal"}, "trans nzoia":{"code":"026","capital":"Kitale"},
-    "uasin gishu":{"code":"027","capital":"Eldoret"}, "elgeyo-marakwet":{"code":"028","capital":"Iten"},
-    "nandi":{"code":"029","capital":"Kapsabet"}, "baringo":{"code":"030","capital":"Kabarnet"},
-    "laikipia":{"code":"031","capital":"Nanyuki"}, "nakuru":{"code":"032","capital":"Nakuru"},
-    "narok":{"code":"033","capital":"Narok"}, "kajiado":{"code":"034","capital":"Kajiado"},
-    "kericho":{"code":"035","capital":"Kericho"}, "bomet":{"code":"036","capital":"Bomet"},
-    "kakamega":{"code":"037","capital":"Kakamega"}, "vihiga":{"code":"038","capital":"Vihiga"},
-    "bungoma":{"code":"039","capital":"Bungoma"}, "busia":{"code":"040","capital":"Busia"},
-    "siaya":{"code":"041","capital":"Siaya"}, "kisumu":{"code":"042","capital":"Kisumu"},
-    "homa bay":{"code":"043","capital":"Homa Bay"}, "migori":{"code":"044","capital":"Migori"},
-    "kisii":{"code":"045","capital":"Kisii"}, "nyamira":{"code":"046","capital":"Nyamira"},
+    "mombasa":{"code":"001","capital":"Mombasa"},"kwale":{"code":"002","capital":"Kwale"},
+    "kilifi":{"code":"003","capital":"Kilifi"},"tana river":{"code":"004","capital":"Hola"},
+    "lamu":{"code":"005","capital":"Lamu"},"taita taveta":{"code":"006","capital":"Wundanyi"},
+    "garissa":{"code":"007","capital":"Garissa"},"wajir":{"code":"008","capital":"Wajir"},
+    "mandera":{"code":"009","capital":"Mandera"},"marsabit":{"code":"010","capital":"Marsabit"},
+    "isiolo":{"code":"011","capital":"Isiolo"},"meru":{"code":"012","capital":"Meru"},
+    "tharaka-nithi":{"code":"013","capital":"Chuka"},"embu":{"code":"014","capital":"Embu"},
+    "kitui":{"code":"015","capital":"Kitui"},"machakos":{"code":"016","capital":"Machakos"},
+    "makueni":{"code":"017","capital":"Wote"},"nyandarua":{"code":"018","capital":"Ol Kalou"},
+    "nyeri":{"code":"019","capital":"Nyeri"},"kirinyaga":{"code":"020","capital":"Kerugoya"},
+    "murang'a":{"code":"021","capital":"Murang'a"},"kiambu":{"code":"022","capital":"Kiambu"},
+    "turkana":{"code":"023","capital":"Lodwar"},"west pokot":{"code":"024","capital":"Kapenguria"},
+    "samburu":{"code":"025","capital":"Maralal"},"trans nzoia":{"code":"026","capital":"Kitale"},
+    "uasin gishu":{"code":"027","capital":"Eldoret"},"elgeyo-marakwet":{"code":"028","capital":"Iten"},
+    "nandi":{"code":"029","capital":"Kapsabet"},"baringo":{"code":"030","capital":"Kabarnet"},
+    "laikipia":{"code":"031","capital":"Nanyuki"},"nakuru":{"code":"032","capital":"Nakuru"},
+    "narok":{"code":"033","capital":"Narok"},"kajiado":{"code":"034","capital":"Kajiado"},
+    "kericho":{"code":"035","capital":"Kericho"},"bomet":{"code":"036","capital":"Bomet"},
+    "kakamega":{"code":"037","capital":"Kakamega"},"vihiga":{"code":"038","capital":"Vihiga"},
+    "bungoma":{"code":"039","capital":"Bungoma"},"busia":{"code":"040","capital":"Busia"},
+    "siaya":{"code":"041","capital":"Siaya"},"kisumu":{"code":"042","capital":"Kisumu"},
+    "homa bay":{"code":"043","capital":"Homa Bay"},"migori":{"code":"044","capital":"Migori"},
+    "kisii":{"code":"045","capital":"Kisii"},"nyamira":{"code":"046","capital":"Nyamira"},
     "nairobi":{"code":"047","capital":"Nairobi"},
 }
 @app.get("/kenya/county")
 async def kenya_county(name: str):
-    key = name.strip().lower()
-    c = KENYA_COUNTIES.get(key)
-    if not c:
-        return {"ok":False,"error":f"County '{name}' not found"}
+    c = KENYA_COUNTIES.get(name.strip().lower())
+    if not c: return {"ok":False,"error":f"County '{name}' not found"}
     return {"ok":True,"name":name.title(),**c,
             "source":"https://en.wikipedia.org/wiki/Counties_of_Kenya"}
-
 @app.get("/kenya/counties")
 async def kenya_counties():
     return {"ok":True,"count":len(KENYA_COUNTIES),
@@ -557,8 +577,7 @@ async def call_model(msgs, temp, prompt="", agent="generalist"):
         except Exception as e: print(f"nvidia: {e}")
     r = await _colab(prompt, agent, temp)
     if r: return r
-    return ("I'm Imhotep, built by Samuel Kiragu in Mukuyu, Murang'a, Kenya. "
-            "My main brain is busy — try again in a moment.")
+    return "I'm Imhotep, built by Samuel Kiragu in Mukuyu, Murang'a, Kenya. Try again in a moment."
 
 @app.post("/chat")
 async def chat(b: ChatIn):
@@ -577,9 +596,9 @@ async def chat(b: ChatIn):
             "used":c["used"],"limit":c["limit"],
             "upgrade_url":"https://kiragu2004.github.io/imhotep-site/pricing.html"})
 
-    # Auto-detect Sheng if user writes typical greeting
     agent = b.agent or "generalist"
-    if agent == "generalist" and is_sheng_query(p):
+    # Auto-switch to sheng if user writes Sheng
+    if is_sheng_query(p):
         agent = "sheng"
 
     t = max(0.0, min(2.0, b.temperature))
@@ -590,15 +609,14 @@ async def chat(b: ChatIn):
             async with httpx.AsyncClient(timeout=10) as c:
                 r = await c.get("https://api.open-meteo.com/v1/forecast",
                     params={"latitude":b.location["lat"],"longitude":b.location["lon"],
-                            "current":"temperature_2m,weather_code",
-                            "timezone":"auto"})
+                            "current":"temperature_2m,weather_code","timezone":"auto"})
             d = r.json()
-            cur = d.get("current", {})
-            if "temperature_2m" in cur:
+            cur = d.get("current") or {}
+            if cur.get("temperature_2m") is not None:
                 cls = classify_wx(round(cur["temperature_2m"]), cur.get("weather_code", 0))
-                w = {"temp":round(cur["temperature_2m"]),
-                     "city":"your area", "description":cls["condition_label"], **cls}
-                s += f"\nUser is in {w['temp']}°C, {w['description']}, {w['feel']}."
+                w = {"temp":round(cur["temperature_2m"]),"city":"your area",
+                     "description":cls["condition_label"], **cls}
+                s += f"\nUser is at {w['temp']}°C, {w['description']}."
         except Exception: pass
 
     msgs = [{"role":"system","content":s},{"role":"user","content":p}]
@@ -651,25 +669,19 @@ async def checkout(b: CheckoutIn):
     webhook_url = "https://imhotep-agentic-ai.onrender.com/nestlink/webhook"
     payment_url = None
     if NESTLINK_API_KEY:
-        attempts = [
-            ("https://api.nestlink.co.ke/v1/checkout",
-             {"amount": t["amount"], "currency": "KES", "email": b.email,
-              "narrative": t["label"], "reference": ref,
-              "redirect_url": success_url, "callback_url": webhook_url}),
-        ]
-        for url, payload in attempts:
-            try:
-                async with httpx.AsyncClient(timeout=30) as c:
-                    r = await c.post(url, json=payload,
-                        headers={"Authorization": f"Bearer {NESTLINK_API_KEY}",
-                                 "Content-Type": "application/json",
-                                 "Accept": "application/json"})
-                if r.status_code < 300:
-                    d = r.json()
-                    payment_url = (d.get("checkout_url") or d.get("url") or
-                                   d.get("payment_url"))
-                    if payment_url: break
-            except Exception as e: print(f"nestlink err: {e}")
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post("https://api.nestlink.co.ke/v1/checkout",
+                    json={"amount": t["amount"], "currency": "KES", "email": b.email,
+                          "narrative": t["label"], "reference": ref,
+                          "redirect_url": success_url, "callback_url": webhook_url},
+                    headers={"Authorization": f"Bearer {NESTLINK_API_KEY}",
+                             "Content-Type": "application/json",
+                             "Accept": "application/json"})
+            if r.status_code < 300:
+                d = r.json()
+                payment_url = (d.get("checkout_url") or d.get("url") or d.get("payment_url"))
+        except Exception as e: print(f"nestlink err: {e}")
     if not payment_url:
         payment_url = (f"https://me.nestlink.co.ke/Imhotepagenticai"
                        f"?email={b.email}&reference={ref}&amount={t['amount']}")
@@ -731,10 +743,9 @@ async def nestlink_logs():
 
 @app.get("/health")
 async def health():
-    return {"ok":True,"version":"4.0.0",
+    return {"ok":True,"version":"5.0.0",
             "model_configured":bool(NVIDIA_API_KEY),
             "colab_fallback_configured":bool(COLAB_MODEL_URL),
-            "weather_configured":True,
             "weather_provider":"open-meteo (no key)",
             "nestlink_configured":bool(NESTLINK_API_KEY),
             "google_configured":bool(GOOGLE_CLIENT_ID),
