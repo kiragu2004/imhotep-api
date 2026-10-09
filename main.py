@@ -306,40 +306,33 @@ async def weather_ep(body: dict):
 
 @app.get("/weather/all-counties")
 async def weather_all():
-    """Use multi-location API in small batches with delay — safe for free tier."""
+    """Weather for all 47 counties — 4 concurrent max."""
     names = list(KENYA_COUNTIES_FULL.keys())
     coords = list(KENYA_COUNTIES_FULL.values())
-    results = []
-    BATCH = 12  # Open-Meteo free tier handles ~10-15 locations per call
-    async with httpx.AsyncClient(timeout=20) as c:
-        for i in range(0, len(coords), BATCH):
-            batch_names = names[i:i+BATCH]
-            batch_coords = coords[i:i+BATCH]
-            lats = ",".join(f"{la:.4f}" for la, lo in batch_coords)
-            lons = ",".join(f"{lo:.4f}" for la, lo in batch_coords)
-            try:
-                r = await c.get("https://api.open-meteo.com/v1/forecast",
-                    params={"latitude": lats, "longitude": lons,
-                            "current": "temperature_2m,weather_code",
-                            "timezone": "Africa/Nairobi"})
-                data = r.json()
-                items = data if isinstance(data, list) else [data]
-                for j, item in enumerate(items):
-                    if j >= len(batch_names): break
-                    cur = item.get("current") or {}
-                    if cur.get("temperature_2m") is None: continue
-                    t = round(cur["temperature_2m"])
-                    cls = classify_wx(t, cur.get("weather_code",0))
-                    results.append({"county": batch_names[j], "temp": t, **cls})
-                # Small delay between batches to avoid rate limit
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                print(f"batch {i} failed: {e}")
-    return {"ok":True,"count":len(results),"counties":results}
+    sem = asyncio.Semaphore(4)
 
-# ═══════════════════════════════════════════════════════════════
-# RAIN PREDICTION HEATMAP — grid over Kenya
-# ═══════════════════════════════════════════════════════════════
+    async def one(name, lat, lon):
+        async with sem:
+            try:
+                async with httpx.AsyncClient(timeout=15) as c:
+                    r = await c.get("https://api.open-meteo.com/v1/forecast",
+                        params={"latitude": f"{lat:.4f}", "longitude": f"{lon:.4f}",
+                                "current": "temperature_2m,weather_code",
+                                "timezone": "Africa/Nairobi"})
+                cur = (r.json().get("current") or {})
+                if cur.get("temperature_2m") is None: return None
+                t = round(cur["temperature_2m"])
+                cls = classify_wx(t, cur.get("weather_code", 0))
+                return {"county": name, "temp": t, **cls}
+            except Exception as e:
+                print(f"{name}: {e}")
+                return None
+
+    done = await asyncio.gather(*[one(n, la, lo) for n, (la, lo) in zip(names, coords)])
+    results = [r for r in done if r]
+    return {"ok": True, "count": len(results), "counties": results}
+
+
 @app.get("/heatmap/rain")
 async def heatmap_rain():
     """Return a 6x6 grid of Kenya with 3-day rain predictions."""
