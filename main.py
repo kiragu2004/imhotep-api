@@ -1,4 +1,3 @@
-
 import os, re, time, secrets, hmac, hashlib, json, pathlib, math, asyncio
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -15,176 +14,139 @@ NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b"
 NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 OPENWEATHER_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 NESTLINK_API_KEY = os.getenv("NESTLINK_API_KEY", "")
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS","*").split(",") if o.strip()]
 
-app = FastAPI(title="Imhotep", version="10.0.0")
+app = FastAPI(title="Imhotep", version="12.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
-LOG_DIR = pathlib.Path("/tmp/imhotep"); LOG_DIR.mkdir(exist_ok=True)
-WEBHOOK_LOG = LOG_DIR / "webhooks.jsonl"
+_CACHE = {}
+def cache_get(k, ttl):
+    e = _CACHE.get(k)
+    if e and (time.time() - e["t"]) < ttl: return e["v"]
+    return None
+def cache_set(k, v): _CACHE[k] = {"t": time.time(), "v": v}
 
 _LEAK = [(r"\bNVIDIA\s+NIM\b","Imhotep"),(r"\bNVIDIA\b","Imhotep"),
          (r"\bNemotron[\w\-\.]*\b","Imhotep"),(r"\bNIM\b","Imhotep"),
          (r"\bQwen[\w\-\.]*\b","Imhotep"),(r"\bDeepSeek[\w\-]*\b","Imhotep"),
-         (r"\bMistral[\w\-]*\b","Imhotep"),(r"\bLlama[\s\-]?[\d\.\w]*\b","Imhotep"),
-         (r"\bOpenAI\b","Imhotep"),(r"\bGPT[\-\s]?\d[\w\.]*\b","Imhotep"),
-         (r"\bClaude[\w\-\.]*\b","Imhotep"),(r"\bGemini[\w\-\.]*\b","Imhotep")]
+         (r"\bMistral[\w\-]*\b","Imhotep"),(r"\bLlama[\s\-]?[\d\.\w]*\b","Imhotep")]
 def scrub(t):
     if not t: return t
     for p, r in _LEAK: t = re.sub(p, r, t, flags=re.IGNORECASE)
     return t
 
-# ═══════════════════════════════════════════════════════════════
-# THINKING STRIP — catches both <think> tags AND plain-text thinking
-# ═══════════════════════════════════════════════════════════════
-THINKING_PREFIXES = (
-    "here's a thinking process", "here is a thinking process",
-    "thinking process:", "let me think", "reasoning:",
-    "let's break this down", "first, let me analyze",
-    "analyze user input", "analyze the user's input",
-    "1. **analyze", "1. analyze user", "identify persona",
-)
-
-def strip_thinking(text: str) -> str:
+THINK = ("here's a thinking","here is a thinking","thinking process","let me think",
+         "let's break this down","analyze user input","1. **analyze","1. analyze user",
+         "identify persona","analyze the user")
+def strip_thinking(text):
     if not text: return text
-    # Strip <think>...</think> blocks
-    text = re.sub(r"<think[^>]*>.*?</think\s*>", "", text,
-                  flags=re.DOTALL | re.IGNORECASE).strip()
-    text = re.sub(r"</?think\b[^>]*>", "", text, flags=re.IGNORECASE).strip()
-    # If the content STARTS with a thinking prefix, try to find the real answer
-    low = text.lower()[:300]
-    if any(low.strip().startswith(p) for p in THINKING_PREFIXES):
-        # Look for a "Final answer" or similar marker
-        for marker in ["final answer:", "final response:", "answer:", "my response:", "reply:"]:
-            idx = text.lower().rfind(marker)
-            if idx > 0:
-                return text[idx + len(marker):].strip()
-        # Otherwise look for the last paragraph (often the actual answer)
-        paras = [p.strip() for p in text.split("\n\n") if p.strip() and len(p.strip()) > 30]
+    text = re.sub(r"<think[^>]*>.*?</think\s*>","",text,flags=re.DOTALL|re.IGNORECASE).strip()
+    text = re.sub(r"</?think\b[^>]*>","",text,flags=re.IGNORECASE).strip()
+    low = text.lower()[:250]
+    if any(low.strip().startswith(p) for p in THINK):
+        for m in ["final answer:","answer:","reply:"]:
+            i = text.lower().rfind(m)
+            if i > 0: return text[i+len(m):].strip()
+        paras = [p.strip() for p in text.split("\n\n") if p.strip() and len(p.strip())>30]
         if paras:
-            # Skip paragraphs that look like analysis
             for p in reversed(paras):
-                p_low = p.lower()
-                # Skip if it contains numbered list markers
-                if re.match(r"^\d+\.", p.strip()):
-                    continue
-                if any(w in p_low for w in ["analyze", "identify", "determine"]):
-                    continue
+                if re.match(r"^\d+\.", p.strip()): continue
+                if any(w in p.lower() for w in ["analyze","identify"]): continue
                 return p
             return paras[-1]
     return text
 
-KENYA_COUNTIES_FULL = {
+KENYA = {
     "Mombasa":(-4.0435,39.6682),"Kwale":(-4.1742,39.4524),"Kilifi":(-3.6305,39.8499),
-    "Tana River":(-1.5000,39.9833),"Lamu":(-2.2717,40.9020),"Taita Taveta":(-3.4000,38.5500),
-    "Garissa":(-0.4536,39.6461),"Wajir":(1.7471,40.0573),"Mandera":(3.9366,41.8670),
-    "Marsabit":(2.3344,37.9899),"Isiolo":(0.3546,37.5822),"Meru":(0.0500,37.6500),
-    "Tharaka-Nithi":(-0.1667,37.9000),"Embu":(-0.5333,37.4500),"Kitui":(-1.3667,38.0167),
-    "Machakos":(-1.5177,37.2634),"Makueni":(-2.0000,37.6167),"Nyandarua":(-0.5000,36.3667),
-    "Nyeri":(-0.4167,36.9500),"Kirinyaga":(-0.5000,37.2833),"Murang'a":(-0.7167,37.1500),
+    "Tana River":(-1.5,39.9833),"Lamu":(-2.2717,40.902),"Taita Taveta":(-3.4,38.55),
+    "Garissa":(-0.4536,39.6461),"Wajir":(1.7471,40.0573),"Mandera":(3.9366,41.867),
+    "Marsabit":(2.3344,37.9899),"Isiolo":(0.3546,37.5822),"Meru":(0.05,37.65),
+    "Tharaka-Nithi":(-0.1667,37.9),"Embu":(-0.5333,37.45),"Kitui":(-1.3667,38.0167),
+    "Machakos":(-1.5177,37.2634),"Makueni":(-2.0,37.6167),"Nyandarua":(-0.5,36.3667),
+    "Nyeri":(-0.4167,36.95),"Kirinyaga":(-0.5,37.2833),"Murang'a":(-0.7167,37.15),
     "Kiambu":(-1.1667,36.8333),"Turkana":(3.1191,35.5973),"West Pokot":(1.2333,35.1167),
-    "Samburu":(1.1000,36.7000),"Trans Nzoia":(1.0167,35.0000),"Uasin Gishu":(0.5143,35.2698),
-    "Elgeyo-Marakwet":(0.5167,35.5000),"Nandi":(0.1833,35.1000),"Baringo":(0.4667,35.9667),
-    "Laikipia":(0.0500,36.7000),"Nakuru":(-0.3031,36.0800),"Narok":(-1.0833,35.8667),
-    "Kajiado":(-1.8500,36.7833),"Kericho":(-0.3667,35.2833),"Bomet":(-0.7833,35.3333),
-    "Kakamega":(0.2827,34.7519),"Vihiga":(0.0500,34.7333),"Bungoma":(0.5667,34.5667),
-    "Busia":(0.4500,34.1167),"Siaya":(0.0667,34.2833),"Kisumu":(-0.0917,34.7680),
-    "Homa Bay":(-0.5167,34.4500),"Migori":(-0.9833,34.4667),"Kisii":(-0.6817,34.7680),
+    "Samburu":(1.1,36.7),"Trans Nzoia":(1.0167,35.0),"Uasin Gishu":(0.5143,35.2698),
+    "Elgeyo-Marakwet":(0.5167,35.5),"Nandi":(0.1833,35.1),"Baringo":(0.4667,35.9667),
+    "Laikipia":(0.05,36.7),"Nakuru":(-0.3031,36.08),"Narok":(-1.0833,35.8667),
+    "Kajiado":(-1.85,36.7833),"Kericho":(-0.3667,35.2833),"Bomet":(-0.7833,35.3333),
+    "Kakamega":(0.2827,34.7519),"Vihiga":(0.05,34.7333),"Bungoma":(0.5667,34.5667),
+    "Busia":(0.45,34.1167),"Siaya":(0.0667,34.2833),"Kisumu":(-0.0917,34.768),
+    "Homa Bay":(-0.5167,34.45),"Migori":(-0.9833,34.4667),"Kisii":(-0.6817,34.768),
     "Nyamira":(-0.5667,34.9333),"Nairobi":(-1.2921,36.8219),
 }
 
 def nearest_county(lat, lon):
-    best, bestd = None, 1e9
-    for name, (clat, clon) in KENYA_COUNTIES_FULL.items():
-        d = math.sqrt((lat-clat)**2 + (lon-clon)**2)
-        if d < bestd: bestd, best = d, name
-    return best
+    b, bd = None, 1e9
+    for n, (cl, cn) in KENYA.items():
+        d = math.sqrt((lat-cl)**2 + (lon-cn)**2)
+        if d < bd: bd, b = d, n
+    return b
 
-DROUGHT_DATA = {"turkana":3,"marsabit":3,"mandera":2,"wajir":2,"garissa":2,
-                "isiolo":2,"samburu":3,"west pokot":2,"baringo":2,"kitui":2,
-                "kilifi":2,"tana river":2,"nairobi":1,"kiambu":1,"murang'a":1,
-                "nyeri":1,"kirinyaga":1,"kajiado":1,"kisumu":1,"mombasa":1}
+DROUGHT = {"turkana":3,"marsabit":3,"mandera":2,"wajir":2,"garissa":2,"isiolo":2,
+           "samburu":3,"west pokot":2,"baringo":2,"kitui":2,"kilifi":2,"tana river":2,
+           "nairobi":1,"kiambu":1,"murang'a":1,"nyeri":1,"kirinyaga":1,"kajiado":1}
 
-def classify_wx(temp, code):
-    try: c = int(code)
-    except: c = 800
-    if c == 800: e,l = "☀️","Clear"
-    elif c in (801,802): e,l = "🌤️","Partly cloudy"
-    elif c in (803,804): e,l = "☁️","Cloudy"
-    elif 200 <= c < 300: e,l = "⛈️","Thunderstorm"
-    elif 300 <= c < 400: e,l = "🌦️","Drizzle"
-    elif 500 <= c < 600: e,l = "🌧️","Rain"
-    elif 600 <= c < 700: e,l = "❄️","Snow"
-    elif 700 <= c < 800: e,l = "🌫️","Foggy"
-    elif c == 0: e,l = "☀️","Clear"
+def classify_wx(t, c):
+    try: c = int(c)
+    except: c = 0
+    if c == 0: e,l = "☀️","Clear"
     elif c == 1: e,l = "🌤️","Mostly clear"
     elif c == 2: e,l = "🌤️","Partly cloudy"
     elif c == 3: e,l = "☁️","Overcast"
     elif c in (45,48): e,l = "🌫️","Foggy"
     elif c in (51,53,55): e,l = "🌦️","Drizzle"
     elif c in (61,63,65): e,l = "🌧️","Rain"
-    elif c in (71,73,75): e,l = "❄️","Snow"
     elif c in (80,81,82): e,l = "🌧️","Showers"
     elif c == 95: e,l = "⛈️","Thunderstorm"
     elif c in (96,99): e,l = "⛈️","Heavy storm"
     else: e,l = "🌤️","Fair"
-    if temp >= 35: f = "scorching hot 🥵"
-    elif temp >= 30: f = "very hot 🥵"
-    elif temp >= 26: f = "hot 🔥"
-    elif temp >= 20: f = "warm 😊"
-    elif temp >= 14: f = "cool 😌"
-    elif temp >= 8: f = "cold 🧥"
+    if t >= 35: f = "scorching 🥵"
+    elif t >= 30: f = "very hot 🥵"
+    elif t >= 26: f = "hot 🔥"
+    elif t >= 20: f = "warm 😊"
+    elif t >= 14: f = "cool 😌"
+    elif t >= 8: f = "cold 🧥"
     else: f = "very cold 🥶"
     return {"emoji":e,"condition_label":l,"feel":f}
 
 PERSONAS = {"generalist":"a broad Kenyan assistant","scientist":"a rigorous scientist",
     "coder":"a senior software engineer","sheng":"a fluent Nairobi Sheng speaker",
     "economist":"an economist","writer":"a writer","analyst":"an analyst"}
-
-SHENG_GREETINGS = ("sasa","niaje","mambo","marada","radudua","sema","bonga","uko poa")
+SHENG_G = ("sasa","niaje","mambo","marada","radudua","sema","bonga","uko poa")
 def is_sheng(p):
     p = p.lower()
-    return any(g in p for g in SHENG_GREETINGS) or "sheng" in p
-
+    return any(g in p for g in SHENG_G) or "sheng" in p
 LEARN = ("teach","explain","how does","why does","tutorial","step by step","code",
-         "function","algorithm","debug","python","javascript","learn","study")
+         "function","algorithm","debug","python","learn","study")
 def is_learn(p):
     p = p.lower()
     return any(s in p for s in LEARN) or len(p.split()) > 25
 
-def sys_prompt(agent, prompt=""):
-    p = PERSONAS.get(agent, "a general assistant")
-    learning = is_learn(prompt) if prompt else False
+def sys_prompt(a, p=""):
+    pp = PERSONAS.get(a, "an assistant")
+    l = is_learn(p) if p else False
     ident = (f"You are Imhotep — a private AI built by Samuel Kiragu in Mukuyu, "
-             f"Murang'a, Kenya. You are the {agent.upper()} agent — {p}.\n"
-             "ABSOLUTE RULES:\n"
-             "1. Output ONLY your final answer. NEVER output thinking, reasoning steps, "
-             "numbered analysis lists, or phrases like 'Here is my thinking' or "
-             "'Let me analyze'. Just answer directly.\n"
+             f"Murang'a, Kenya. You are the {a.upper()} agent — {pp}.\n"
+             "RULES: 1. Output ONLY final answer. No thinking. "
              "2. NEVER mention NVIDIA, Nemotron, Qwen, DeepSeek, Llama, Mistral, GPT, "
-             "Claude, Gemini, OpenAI, Meta. If asked what model powers you: "
-             "'I'm Imhotep, built by Samuel Kiragu in Kenya.'\n"
-             "3. Speak in first person as Imhotep.\n")
-    if agent == "sheng":
-        return (ident + "\nSHENG MODE: Reply in Sheng mixed with Kiswahili and English. "
-                "Use: sasa, niaje, mambo, poa, fiti, msee, mtaa, ocha, doo, chapaa. "
-                "Keep it 1-3 sentences.")
-    if learning:
-        return ident + "Reply structured: 1. Summary. 2. Steps. 3. Example."
-    return ident + "Reply SHORT (1-3 sentences). Warm, direct."
+             "Claude, Gemini, OpenAI. If asked: 'I'm Imhotep, built by Samuel Kiragu.'\n")
+    if a == "sheng":
+        return (ident + "Reply in Sheng mixed with Kiswahili and English. "
+                "Use: sasa, niaje, mambo, poa, fiti, msee, mtaa.")
+    if l: return ident + "Reply structured: summary, steps, example."
+    return ident + "Reply SHORT (1-3 sentences)."
 
 users_db, chat_db = {}, {}
-TIER_CREDITS = {"guest":3,"free":3,"starter_10":3,"starter_20":20,"starter_50":100,
-                "weekly":10000,"monthly":10000,"yearly":10000}
+TIER_C = {"guest":3,"free":3,"starter_10":3,"starter_20":20,"starter_50":100,
+          "weekly":10000,"monthly":10000,"yearly":10000}
 PRICES = {"starter_10":{"amount":10,"label":"3 chats"},
           "starter_20":{"amount":20,"label":"20 chats"},
           "starter_50":{"amount":50,"label":"100 chats"},
           "weekly":{"amount":99,"label":"Weekly unlimited"},
           "monthly":{"amount":299,"label":"Monthly unlimited"},
           "yearly":{"amount":5000,"label":"Yearly unlimited"}}
-TIER_ALIAS = {"starter":"starter_10","pro":"monthly"}
+TALIAS = {"starter":"starter_10","pro":"monthly"}
 
 class ChatIn(BaseModel):
     prompt: str; agent: Optional[str]="generalist"; user_id: Optional[str]=None
@@ -194,30 +156,365 @@ class CheckoutIn(BaseModel): tier: str; email: EmailStr
 class GoogleIn(BaseModel): id_token: str
 class DebateIn(BaseModel): proposition: str; agents: Optional[List[str]]=None
 
-def issue(uid, days=30):
-    return jwt.encode({"user_id":uid,"exp":datetime.now(timezone.utc)+timedelta(days=days)},
+def issue(u, days=30):
+    return jwt.encode({"user_id":u,"exp":datetime.now(timezone.utc)+timedelta(days=days)},
                       SECRET_KEY, algorithm="HS256")
-def mk_user(email, name, tier="free"):
+def mk_user(e, n, t="free"):
     for u, v in users_db.items():
-        if v["email"] == email: return (u, False)
+        if v["email"] == e: return (u, False)
     u = f"user_{int(time.time()*1000)}"
-    users_db[u] = {"email":email,"name":name,"tier":tier,
-                   "credits":TIER_CREDITS.get(tier,3),"credits_used":0,
-                   "created_at":datetime.now(timezone.utc).isoformat()}
+    users_db[u] = {"email":e,"name":n,"tier":t,"credits":TIER_C.get(t,3),
+                   "credits_used":0,"created_at":datetime.now(timezone.utc).isoformat()}
     chat_db[u] = []
     return (u, True)
-def creds(uid):
-    if uid not in users_db: return {"used":0,"remaining":0,"limit":0,"allowed":False}
-    u = users_db[uid]; t = u.get("credits",0); s = u.get("credits_used",0)
+def creds(u):
+    if u not in users_db: return {"used":0,"remaining":0,"limit":0,"allowed":False}
+    x = users_db[u]; t = x.get("credits",0); s = x.get("credits_used",0)
     return {"used":s,"remaining":max(0,t-s),"limit":t,"allowed":s<t}
-def debit(uid):
-    if uid not in users_db or not creds(uid)["allowed"]: return False
-    users_db[uid]["credits_used"] = users_db[uid].get("credits_used",0) + 1
+def debit(u):
+    if u not in users_db or not creds(u)["allowed"]: return False
+    users_db[u]["credits_used"] = users_db[u].get("credits_used",0) + 1
     return True
 
 # ═══════════════════════════════════════════════════════════════
-# MODEL CALL — with aggressive thinking strip
+# WEATHER — batches of 3, sequential, cached 5min
 # ═══════════════════════════════════════════════════════════════
+@app.get("/weather/all-counties")
+async def weather_all():
+    ck = "all_wx"
+    c = cache_get(ck, 300)
+    if c:
+        return {"ok": True, "count": len(c), "counties": c, "cached": True}
+    names = list(KENYA.keys())
+    coords = list(KENYA.values())
+    results = []
+    for i in range(0, len(coords), 3):
+        bn = names[i:i+3]
+        bc = coords[i:i+3]
+        lats = ",".join(f"{la:.4f}" for la, lo in bc)
+        lons = ",".join(f"{lo:.4f}" for la, lo in bc)
+        try:
+            async with httpx.AsyncClient(timeout=12) as cc:
+                r = await cc.get("https://api.open-meteo.com/v1/forecast",
+                    params={"latitude": lats, "longitude": lons,
+                            "current": "temperature_2m,weather_code",
+                            "timezone": "Africa/Nairobi"})
+            print(f"wx batch {i//3}: {r.status_code}")
+            if r.status_code != 200: continue
+            data = r.json()
+            items = data if isinstance(data, list) else [data]
+            for j, it in enumerate(items):
+                if j >= len(bn): break
+                cur = it.get("current") or {}
+                if cur.get("temperature_2m") is None: continue
+                t = round(cur["temperature_2m"])
+                cls = classify_wx(t, cur.get("weather_code", 0))
+                results.append({"county": bn[j], "temp": t, **cls})
+        except Exception as e:
+            print(f"wx batch {i//3} err: {e}")
+        await asyncio.sleep(0.35)
+    if results: cache_set(ck, results)
+    return {"ok": True, "count": len(results), "counties": results, "cached": False}
+
+@app.get("/debug/openmeteo")
+async def debug_om():
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get("https://api.open-meteo.com/v1/forecast",
+                params={"latitude": "-1.2921,0.05", "longitude": "36.8219,37.65",
+                        "current": "temperature_2m,weather_code",
+                        "timezone": "Africa/Nairobi"})
+        return {"ok": True, "status": r.status_code, "body": r.text[:1200]}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "type": type(e).__name__}
+
+@app.post("/weather")
+async def weather_ep(b: dict):
+    lat, lon, city = b.get("lat"), b.get("lon"), b.get("city")
+    if lat is None and city and city in KENYA:
+        lat, lon = KENYA[city]
+    if lat is None or lon is None: raise HTTPException(400, "Need lat/lon or city")
+    if OPENWEATHER_KEY:
+        try:
+            params = ({"lat":lat,"lon":lon} if not city else {"q":f"{city},KE"})
+            params.update({"appid":OPENWEATHER_KEY,"units":"metric"})
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.get("https://api.openweathermap.org/data/2.5/weather", params=params)
+            d = r.json()
+            if "main" in d:
+                t = round(d["main"]["temp"]); cls = classify_wx(t, d["weather"][0]["id"])
+                return {"ok":True,"temp":t,"condition":d["weather"][0]["main"],
+                        "city":d.get("name") or city or "","humidity":d["main"].get("humidity"),**cls}
+        except Exception: pass
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.get("https://api.open-meteo.com/v1/forecast",
+            params={"latitude":lat,"longitude":lon,
+                    "current":"temperature_2m,weather_code,relative_humidity_2m",
+                    "timezone":"Africa/Nairobi"})
+    cur = (r.json().get("current") or {})
+    t = round(cur.get("temperature_2m",0)); cls = classify_wx(t, cur.get("weather_code",0))
+    return {"ok":True,"temp":t,"condition":cls["condition_label"],
+            "humidity":cur.get("relative_humidity_2m"),
+            "city":city or f"{lat:.2f},{lon:.2f}", **cls}
+
+@app.get("/heatmap/rain")
+async def heatmap():
+    ck = "hm"
+    c = cache_get(ck, 900)
+    if c: return {"ok": True, "grid_size": 5, "cells": c, "cached": True}
+    lat_min, lat_max, lon_min, lon_max, N = -4.7, 5.0, 33.9, 41.9, 5
+    pts = []
+    for i in range(N):
+        for j in range(N):
+            pts.append((lat_min + (lat_max-lat_min)*i/(N-1),
+                        lon_min + (lon_max-lon_min)*j/(N-1)))
+    out = []
+    for i in range(0, len(pts), 3):
+        chunk = pts[i:i+3]
+        lats = ",".join(f"{la:.3f}" for la, lo in chunk)
+        lons = ",".join(f"{lo:.3f}" for la, lo in chunk)
+        try:
+            async with httpx.AsyncClient(timeout=12) as cc:
+                r = await cc.get("https://api.open-meteo.com/v1/forecast",
+                    params={"latitude": lats, "longitude": lons,
+                            "daily": "precipitation_sum", "forecast_days": 3,
+                            "timezone": "Africa/Nairobi"})
+            if r.status_code != 200: continue
+            data = r.json()
+            items = data if isinstance(data, list) else [data]
+            for k, it in enumerate(items):
+                if k >= len(chunk): break
+                la, lo = chunk[k]
+                daily = it.get("daily", {}).get("precipitation_sum", []) or []
+                total = sum(v for v in daily if v is not None)
+                out.append({"lat":round(la,2),"lon":round(lo,2),
+                            "rain_mm":round(total,1),"county":nearest_county(la,lo) or ""})
+        except Exception as e: print(f"hm: {e}")
+        await asyncio.sleep(0.35)
+    if out: cache_set(ck, out)
+    return {"ok": True, "grid_size": N, "cells": out, "cached": False}
+
+@app.get("/fires/kenya")
+async def fires():
+    ck = "fires"
+    c = cache_get(ck, 300)
+    if c: return c
+    urls = ["https://firms.modaps.eosdis.nasa.gov/data/active_fire/suomi-npp-viirs-c2/csv/SUOMI_VIIRS_C2_Global_24h.csv",
+            "https://firms.modaps.eosdis.nasa.gov/data/active_fire/modis-c6.1/csv/MODIS_C6_1_Global_24h.csv"]
+    fires = []
+    async with httpx.AsyncClient(timeout=45) as c:
+        for url in urls:
+            try:
+                r = await c.get(url)
+                if r.status_code >= 300: continue
+                lines = r.text.strip().split("\n")
+                if not lines: continue
+                hdr = lines[0].split(",")
+                for line in lines[1:]:
+                    p = line.split(",")
+                    if len(p) < len(hdr): continue
+                    row = dict(zip(hdr, p))
+                    try: la=float(row.get("latitude",0)); lo=float(row.get("longitude",0))
+                    except: continue
+                    if -5<=la<=6 and 33<=lo<=42:
+                        fires.append({"lat":la,"lon":lo,
+                                      "county":nearest_county(la,lo) or "Unknown",
+                                      "brightness":row.get("bright_ti4") or row.get("brightness"),
+                                      "confidence":row.get("confidence"),
+                                      "date":row.get("acq_date"),"time":row.get("acq_time"),
+                                      "satellite":row.get("satellite")})
+            except Exception: continue
+    result = {"ok":True,"count":len(fires),"fires":fires[:100]}
+    cache_set(ck, result)
+    return result
+
+@app.get("/lightning")
+async def lightning():
+    ck = "lgt"
+    c = cache_get(ck, 300)
+    if c: return c
+    names = list(KENYA.keys()); coords = list(KENYA.values())
+    storms = []
+    for i in range(0, len(coords), 3):
+        bn = names[i:i+3]; bc = coords[i:i+3]
+        lats = ",".join(f"{la:.4f}" for la, lo in bc)
+        lons = ",".join(f"{lo:.4f}" for la, lo in bc)
+        try:
+            async with httpx.AsyncClient(timeout=12) as cc:
+                r = await cc.get("https://api.open-meteo.com/v1/forecast",
+                    params={"latitude": lats, "longitude": lons,
+                            "current": "weather_code,temperature_2m",
+                            "timezone": "Africa/Nairobi"})
+            if r.status_code != 200: continue
+            data = r.json()
+            items = data if isinstance(data, list) else [data]
+            for j, it in enumerate(items):
+                if j >= len(bn): break
+                cur = it.get("current") or {}
+                code = cur.get("weather_code", 0)
+                if code in (95, 96, 99):
+                    storms.append({"county": bn[j], "code": code,
+                                   "temp": round(cur.get("temperature_2m",0)),
+                                   "severity": "Heavy" if code==99 else "Moderate" if code==96 else "Thunderstorm"})
+        except Exception: continue
+        await asyncio.sleep(0.35)
+    result = {"ok":True,"count":len(storms),"storms":storms}
+    cache_set(ck, result)
+    return result
+
+@app.get("/drought/{county}")
+async def drought(county: str):
+    p = DROUGHT.get(county.strip().lower())
+    if p is None: return {"ok":False,"error":f"No data for '{county}'"}
+    labels = {1:"Minimal",2:"Alert",3:"Alarm",4:"Emergency",5:"Famine"}
+    return {"ok":True,"county":county.title(),"phase":p,"label":labels[p]}
+
+@app.get("/ndvi/{county}")
+async def ndvi(county: str):
+    p = DROUGHT.get(county.strip().lower())
+    if p is None: return {"ok":False,"error":f"No data for '{county}'"}
+    vci = {1:55,2:40,3:25,4:15,5:5}.get(p,40)
+    s = "Wet" if vci>=50 else "Normal" if vci>=35 else "Moderate drought" if vci>=21 else "Severe drought" if vci>=10 else "Extreme"
+    return {"ok":True,"county":county.title(),"vci":vci,"status":s,
+            "ndvi_explanation":"NDVI = vegetation greenness from satellite.",
+            "vci_explanation":"VCI = today vs historical. Below 35 = early warning."}
+
+@app.get("/flood/{county}")
+async def flood(county: str):
+    k = county.strip().lower()
+    coords = next((c for n, c in KENYA.items() if n.lower()==k), None)
+    if not coords: return {"ok":False,"error":"Unknown county"}
+    la, lo = coords
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get("https://flood-api.open-meteo.com/v1/flood",
+                params={"latitude":la,"longitude":lo,
+                        "daily":"river_discharge","forecast_days":7})
+        vals = r.json().get("daily",{}).get("river_discharge",[]) or []
+        peak = max(vals) if vals else 0
+        if peak>500: level,color = "SEVERE","#ff2b2b"
+        elif peak>200: level,color = "HIGH","#ff6b6b"
+        elif peak>80: level,color = "MODERATE","#ffaa00"
+        elif peak>30: level,color = "LOW","#00c87a"
+        else: level,color = "MINIMAL","#00d9ff"
+        return {"ok":True,"county":county.title(),
+                "current_discharge": round(vals[0],1) if vals else 0,
+                "peak_next_7d": round(peak,1),"level":level,"color":color}
+    except Exception as e:
+        return {"ok":False,"error":str(e)}
+
+@app.get("/disasters")
+async def disasters():
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.get("https://www.gdacs.org/gdacsapi/api/Events/geteventlist/SEARCH",
+                            params={"fromDate":"2024-01-01","toDate":"2026-12-31",
+                                    "alertlevel":"Green;Orange;Red"})
+        evs = r.json().get("features",[])
+        kn = [{"type":e.get("properties",{}).get("eventtype",""),
+               "alert_level":e.get("properties",{}).get("alertlevel",""),
+               "title":e.get("properties",{}).get("name",""),
+               "country":e.get("properties",{}).get("country",""),
+               "date":e.get("properties",{}).get("todate","")}
+              for e in evs if "kenya" in str(e.get("properties",{}).get("country","")).lower()]
+        return {"ok":True,"count":len(kn),"events":kn[:20]}
+    except Exception as e:
+        return {"ok":False,"error":str(e)}
+
+@app.get("/nasa/power/{county}")
+async def nasa_power(county: str):
+    k = county.strip().lower()
+    coords = next((c for n, c in KENYA.items() if n.lower()==k), None)
+    if not coords: return {"ok":False,"error":"Unknown county"}
+    la, lo = coords
+    end = datetime.now(timezone.utc) - timedelta(days=2)
+    start = end - timedelta(days=30)
+    try:
+        async with httpx.AsyncClient(timeout=45) as c:
+            r = await c.get("https://power.larc.nasa.gov/api/temporal/daily/point",
+                params={"parameters":"PRECTOTCORR,T2M","community":"AG",
+                        "longitude":lo,"latitude":la,
+                        "start":start.strftime("%Y%m%d"),
+                        "end":end.strftime("%Y%m%d"),"format":"JSON"})
+        pr = r.json().get("properties",{}).get("parameter",{})
+        rv = [v for v in pr.get("PRECTOTCORR",{}).values() if isinstance(v,(int,float))]
+        tv = [v for v in pr.get("T2M",{}).values() if isinstance(v,(int,float))]
+        return {"ok":True,"county":county.title(),
+                "rain_30d_mm": round(sum(rv),1) if rv else 0,
+                "avg_temp_c": round(sum(tv)/len(tv),1) if tv else 0,
+                "days": len(rv)}
+    except Exception as e:
+        return {"ok":False,"error":str(e)}
+
+@app.get("/news/kenya")
+async def news(limit: int = 10):
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get("https://www.standardmedia.co.ke/rss/headlines.php",
+                            headers={"User-Agent":"Imhotep/1.0"})
+        root = ET.fromstring(r.text)
+        items = [{"title":(i.findtext("title") or "").strip(),
+                  "link":(i.findtext("link") or "").strip()}
+                 for i in root.findall(".//item")[:limit]]
+        return {"ok":True,"count":len(items),"items":items}
+    except Exception as e: raise HTTPException(502, str(e))
+
+@app.get("/climate/kenya")
+async def climate():
+    c = cache_get("climate", 3600)
+    if c: return c
+    lat, lon = -1.2921, 36.8219
+    try:
+        async with httpx.AsyncClient(timeout=90) as cc:
+            r1 = await cc.get("https://archive-api.open-meteo.com/v1/archive",
+                params={"latitude":lat,"longitude":lon,"start_date":"1985-01-01",
+                        "end_date":"2014-12-31","daily":"temperature_2m_max",
+                        "timezone":"Africa/Nairobi"})
+            h = r1.json()
+            r2 = await cc.get("https://climate-api.open-meteo.com/v1/climate",
+                params={"latitude":lat,"longitude":lon,"start_date":"2025-01-01",
+                        "end_date":"2050-12-31","models":"MRI_AGCM3_2_S",
+                        "daily":"temperature_2m_max"})
+            p = r2.json()
+    except Exception as e: raise HTTPException(502, str(e))
+    def avg(a):
+        v = [x for x in (a or []) if isinstance(x,(int,float))]
+        return round(sum(v)/len(v),2) if v else None
+    ht = avg(h.get("daily",{}).get("temperature_2m_max",[]))
+    pt = avg(p.get("daily",{}).get("temperature_2m_max",[]))
+    dt = round(pt-ht,2) if (ht and pt) else None
+    result = {"ok":True,"historical":{"period":"1985-2014","avg_tmax_c":ht},
+              "projection":{"period":"2025-2050","avg_tmax_c":pt},
+              "change":{"warming_c":dt,
+                        "verdict":"Kenya is warming — prepare for heat stress" if dt and dt>0.5
+                                  else "Stable" if dt and abs(dt)<=0.5 else "Cooling"}}
+    cache_set("climate", result)
+    return result
+
+@app.get("/nasa/earth")
+async def earth():
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get("https://epic.gsfc.nasa.gov/api/natural")
+    items = r.json()
+    if not items: raise HTTPException(404, "No images")
+    l = items[0]
+    dp = l["date"].split(" ")[0].replace("-","/")
+    return {"ok":True,"date":l["date"],
+            "image_url":f"https://epic.gsfc.nasa.gov/archive/natural/{dp}/png/{l['image']}.png"}
+
+@app.get("/img/proxy")
+async def proxy(url: str):
+    ALLOWED = ("epic.gsfc.nasa.gov","cdn.star.nesdis.noaa.gov","gibs.earthdata.nasa.gov","images-api.nasa.gov")
+    from urllib.parse import urlparse
+    h = urlparse(url).netloc
+    if not any(h.endswith(d) for d in ALLOWED): raise HTTPException(403,"Domain not allowed")
+    async with httpx.AsyncClient(timeout=45) as c:
+        r = await c.get(url, headers={"User-Agent":"Imhotep/1.0"})
+    if r.status_code >= 300: raise HTTPException(r.status_code,"Upstream")
+    return StreamingResponse(iter([r.content]),
+        media_type=r.headers.get("content-type","image/jpeg"),
+        headers={"Cache-Control":"public, max-age=600","Access-Control-Allow-Origin":"*"})
+
 async def nvidia_call(msgs, temp):
     body = {"model":NVIDIA_MODEL,"messages":msgs,"temperature":temp,
             "top_p":0.95,"max_tokens":2048}
@@ -226,10 +523,9 @@ async def nvidia_call(msgs, temp):
             headers={"Authorization":f"Bearer {NVIDIA_API_KEY}",
                      "Content-Type":"application/json"}, json=body)
     if r.status_code >= 300: raise Exception(f"NVIDIA {r.status_code}")
-    msg = r.json()["choices"][0]["message"]
-    content = (msg.get("content") or "").strip()
-    if not content:
-        content = (msg.get("reasoning_content") or "").strip()
+    m = r.json()["choices"][0]["message"]
+    content = (m.get("content") or "").strip()
+    if not content: content = (m.get("reasoning_content") or "").strip()
     return strip_thinking(content) or "[No reply]"
 
 async def call_model(msgs, temp):
@@ -238,15 +534,12 @@ async def call_model(msgs, temp):
         except Exception as e: print(f"nvidia: {e}")
     return "I'm Imhotep, built by Samuel Kiragu in Mukuyu, Murang'a, Kenya."
 
-# ═══════════════════════════════════════════════════════════════
-# AUTH
-# ═══════════════════════════════════════════════════════════════
 @app.get("/agents")
 async def agents(): return {"ok":True,"agents":list(PERSONAS.keys())}
 
 @app.post("/auth/signup")
 async def signup(b: SignupIn):
-    u, new = mk_user(b.email.lower(), b.name, "free")
+    u, _ = mk_user(b.email.lower(), b.name, "free")
     return {"ok":True,"user_id":u,"token":issue(u),"user":users_db[u]}
 
 @app.get("/auth/guest")
@@ -264,486 +557,12 @@ async def google(b: GoogleIn):
             r = await c.post("https://oauth2.googleapis.com/tokeninfo",
                              params={"id_token": b.id_token})
         info = r.json()
-    except Exception as e: raise HTTPException(400, f"Google failed: {e}")
-    email = info.get("email")
-    if not email: raise HTTPException(400, "Invalid token")
-    u, _ = mk_user(email.lower(), info.get("name","Google User"), "free")
+    except Exception as e: raise HTTPException(400, f"Google: {e}")
+    e = info.get("email")
+    if not e: raise HTTPException(400, "Invalid token")
+    u, _ = mk_user(e.lower(), info.get("name","Google User"), "free")
     return {"ok":True,"user_id":u,"token":issue(u),"user":users_db[u]}
 
-# ═══════════════════════════════════════════════════════════════
-# WEATHER — all counties with BATCHED requests (5 per batch, sequential batches)
-# ═══════════════════════════════════════════════════════════════
-@app.post("/weather")
-async def weather_ep(body: dict):
-    lat, lon, city = body.get("lat"), body.get("lon"), body.get("city")
-    if lat is None and city and city in KENYA_COUNTIES_FULL:
-        lat, lon = KENYA_COUNTIES_FULL[city]
-    if lat is None or lon is None:
-        raise HTTPException(400, "Need lat/lon or valid city")
-    if OPENWEATHER_KEY:
-        try:
-            params = ({"lat":lat,"lon":lon} if not city else {"q":f"{city},KE"})
-            params.update({"appid":OPENWEATHER_KEY,"units":"metric"})
-            async with httpx.AsyncClient(timeout=15) as c:
-                r = await c.get("https://api.openweathermap.org/data/2.5/weather", params=params)
-            d = r.json()
-            if "main" in d:
-                t = round(d["main"]["temp"]); cls = classify_wx(t, d["weather"][0]["id"])
-                return {"ok":True,"temp":t,"condition":d["weather"][0]["main"],
-                        "city":d.get("name") or city or "",
-                        "humidity":d["main"].get("humidity"), **cls}
-        except Exception: pass
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.get("https://api.open-meteo.com/v1/forecast",
-            params={"latitude":lat,"longitude":lon,
-                    "current":"temperature_2m,weather_code,relative_humidity_2m",
-                    "timezone":"Africa/Nairobi"})
-    cur = (r.json().get("current") or {})
-    t = round(cur.get("temperature_2m",0)); cls = classify_wx(t, cur.get("weather_code",0))
-    return {"ok":True,"temp":t,"condition":cls["condition_label"],
-            "humidity":cur.get("relative_humidity_2m"),
-            "city":city or f"{lat:.2f},{lon:.2f}", **cls}
-
-@app.get("/weather/all-counties")
-async def weather_all():
-    """All 47 counties — sequential batches of 10, 1 concurrent."""
-    names = list(KENYA_COUNTIES_FULL.keys())
-    coords = list(KENYA_COUNTIES_FULL.values())
-    results = []
-    BATCH = 10
-
-    for i in range(0, len(coords), BATCH):
-        batch_names = names[i:i+BATCH]
-        batch_coords = coords[i:i+BATCH]
-        lats = ",".join(f"{la:.4f}" for la, lo in batch_coords)
-        lons = ",".join(f"{lo:.4f}" for la, lo in batch_coords)
-
-        try:
-            async with httpx.AsyncClient(timeout=20) as c:
-                r = await c.get("https://api.open-meteo.com/v1/forecast",
-                    params={"latitude": lats, "longitude": lons,
-                            "current": "temperature_2m,weather_code",
-                            "timezone": "Africa/Nairobi"})
-            print(f"batch {i//BATCH}: status={r.status_code} len={len(r.text)}")
-
-            if r.status_code != 200:
-                print(f"  body: {r.text[:200]}")
-                continue
-
-            data = r.json()
-            if isinstance(data, list):
-                items = data
-            elif isinstance(data, dict):
-                if "error" in data or "reason" in data:
-                    print(f"  API error: {data}")
-                    continue
-                items = [data]
-            else:
-                continue
-
-            for j, item in enumerate(items):
-                if j >= len(batch_names): break
-                cur = item.get("current") or {}
-                if cur.get("temperature_2m") is None: continue
-                t = round(cur["temperature_2m"])
-                cls = classify_wx(t, cur.get("weather_code", 0))
-                results.append({"county": batch_names[j], "temp": t, **cls})
-            # Respect 1-concurrent limit — pause between batches
-            await asyncio.sleep(0.8)
-        except Exception as e:
-            print(f"batch {i//BATCH} exception: {e}")
-            continue
-    return {"ok": True, "count": len(results), "counties": results}
-
-
-@app.get("/heatmap/rain")
-async def heatmap_rain():
-    """36-cell rain grid — sequential batches of 10."""
-    lat_min, lat_max = -4.7, 5.0
-    lon_min, lon_max = 33.9, 41.9
-    N = 6
-    cells = []
-    for i in range(N):
-        for j in range(N):
-            la = lat_min + (lat_max - lat_min) * i / (N - 1)
-            lo = lon_min + (lon_max - lon_min) * j / (N - 1)
-            cells.append((la, lo))
-
-    out = []
-    BATCH = 10
-    for i in range(0, len(cells), BATCH):
-        chunk = cells[i:i+BATCH]
-        lats = ",".join(f"{la:.3f}" for la, lo in chunk)
-        lons = ",".join(f"{lo:.3f}" for la, lo in chunk)
-        try:
-            async with httpx.AsyncClient(timeout=20) as c:
-                r = await c.get("https://api.open-meteo.com/v1/forecast",
-                    params={"latitude": lats, "longitude": lons,
-                            "daily": "precipitation_sum", "forecast_days": 3,
-                            "timezone": "Africa/Nairobi"})
-            if r.status_code != 200:
-                print(f"heatmap batch {i//BATCH} status {r.status_code}")
-                continue
-            data = r.json()
-            items = data if isinstance(data, list) else [data]
-            for k, item in enumerate(items):
-                if k >= len(chunk): break
-                la, lo = chunk[k]
-                daily = item.get("daily", {}).get("precipitation_sum", []) or []
-                total = sum(v for v in daily if v is not None)
-                out.append({"lat": round(la, 2), "lon": round(lo, 2),
-                            "rain_mm": round(total, 1),
-                            "county": nearest_county(la, lo) or ""})
-            await asyncio.sleep(0.8)
-        except Exception as e:
-            print(f"heatmap exception: {e}")
-            continue
-    return {"ok": True, "grid_size": N, "cells": out}
-
-
-@app.get("/lightning")
-async def lightning():
-    """Thunderstorms across Kenya — sequential batches of 10."""
-    names = list(KENYA_COUNTIES_FULL.keys())
-    coords = list(KENYA_COUNTIES_FULL.values())
-    storms = []
-    BATCH = 10
-    for i in range(0, len(coords), BATCH):
-        bn = names[i:i+BATCH]
-        bc = coords[i:i+BATCH]
-        lats = ",".join(f"{la:.4f}" for la, lo in bc)
-        lons = ",".join(f"{lo:.4f}" for la, lo in bc)
-        try:
-            async with httpx.AsyncClient(timeout=20) as c:
-                r = await c.get("https://api.open-meteo.com/v1/forecast",
-                    params={"latitude": lats, "longitude": lons,
-                            "current": "weather_code,temperature_2m",
-                            "timezone": "Africa/Nairobi"})
-            if r.status_code != 200: continue
-            data = r.json()
-            items = data if isinstance(data, list) else [data]
-            for j, item in enumerate(items):
-                if j >= len(bn): break
-                cur = item.get("current") or {}
-                code = cur.get("weather_code", 0)
-                if code in (95, 96, 99):
-                    storms.append({"county": bn[j], "code": code,
-                                   "temp": round(cur.get("temperature_2m", 0)),
-                                   "severity": "Heavy" if code == 99 else "Moderate" if code == 96 else "Thunderstorm"})
-            await asyncio.sleep(0.8)
-        except Exception as e:
-            print(f"lightning batch {i//BATCH}: {e}")
-            continue
-    return {"ok": True, "count": len(storms), "storms": storms}
-
-
-@app.get("/debug/weather")
-async def debug_weather():
-    """Return RAW Open-Meteo response for first 5 counties — for debugging."""
-    names = list(KENYA_COUNTIES_FULL.keys())[:5]
-    coords = list(KENYA_COUNTIES_FULL.values())[:5]
-    lats = ",".join(f"{la:.4f}" for la, lo in coords)
-    lons = ",".join(f"{lo:.4f}" for la, lo in coords)
-    try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get("https://api.open-meteo.com/v1/forecast",
-                params={"latitude": lats, "longitude": lons,
-                        "current": "temperature_2m,weather_code",
-                        "timezone": "Africa/Nairobi"})
-        return {"ok": True, "status": r.status_code,
-                "lats": lats, "lons": lons,
-                "response_preview": r.text[:1500]}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "lats": lats, "lons": lons}
-
-
-@app.get("/flood/{county}")
-async def flood(county: str):
-    """River discharge forecast for a Kenyan county. Open-Meteo Flood API."""
-    key = county.strip().lower()
-    coords = None
-    for name, c in KENYA_COUNTIES_FULL.items():
-        if name.lower() == key:
-            coords = c; break
-    if not coords:
-        return {"ok": False, "error": f"Unknown county '{county}'"}
-    la, lo = coords
-    try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get("https://flood-api.open-meteo.com/v1/flood",
-                params={"latitude": la, "longitude": lo,
-                        "daily": "river_discharge",
-                        "forecast_days": 7})
-        d = r.json()
-        daily = d.get("daily", {})
-        values = daily.get("river_discharge", [])
-        dates = daily.get("time", [])
-        peak = max(values) if values else 0
-        latest = values[0] if values else 0
-        # Simple risk classification
-        if peak > 500: level, color = "SEVERE", "#ff2b2b"
-        elif peak > 200: level, color = "HIGH", "#ff6b6b"
-        elif peak > 80: level, color = "MODERATE", "#ffaa00"
-        elif peak > 30: level, color = "LOW", "#00c87a"
-        else: level, color = "MINIMAL", "#00d9ff"
-        return {"ok":True,"county":county.title(),
-                "current_discharge": round(latest, 1) if latest else 0,
-                "peak_next_7d": round(peak, 1) if peak else 0,
-                "level": level, "color": color,
-                "dates": dates, "values": [round(v,1) if v else 0 for v in values],
-                "source": "Open-Meteo Flood API (GloFAS)"}
-    except Exception as e:
-        return {"ok":False,"error":str(e)}
-
-# ═══════════════════════════════════════════════════════════════
-# GDACS — Global Disaster Alerts (free, no key)
-# ═══════════════════════════════════════════════════════════════
-@app.get("/disasters")
-async def disasters():
-    """Global disaster alerts affecting Kenya. GDACS API, free, no key."""
-    try:
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.get("https://www.gdacs.org/gdacsapi/api/Events/geteventlist/SEARCH",
-                            params={"fromDate": "2024-01-01", "toDate": "2026-12-31",
-                                    "alertlevel": "Green;Orange;Red"})
-        data = r.json()
-        events = data.get("features", [])
-        # Filter for Kenya
-        kenya = []
-        for e in events:
-            props = e.get("properties", {})
-            country = str(props.get("country", ""))
-            if "kenya" in country.lower():
-                kenya.append({
-                    "type": props.get("eventtype", ""),
-                    "alert_level": props.get("alertlevel", ""),
-                    "title": props.get("name", ""),
-                    "country": country,
-                    "date": props.get("todate", ""),
-                    "url": props.get("url", {}).get("report", "") if isinstance(props.get("url"), dict) else "",
-                })
-        return {"ok":True,"count":len(kenya),"events":kenya[:20]}
-    except Exception as e:
-        return {"ok":False,"error":str(e)}
-
-# ═══════════════════════════════════════════════════════════════
-# NASA POWER — precipitation & climate data (free, no key)
-# ═══════════════════════════════════════════════════════════════
-@app.get("/nasa/power/{county}")
-async def nasa_power(county: str):
-    """NASA POWER: 30-day rainfall + temperature for a county. Free, no key."""
-    key = county.strip().lower()
-    coords = None
-    for name, c in KENYA_COUNTIES_FULL.items():
-        if name.lower() == key:
-            coords = c; break
-    if not coords:
-        return {"ok": False, "error": f"Unknown county '{county}'"}
-    la, lo = coords
-    # Last 30 days
-    end = datetime.now(timezone.utc) - timedelta(days=2)
-    start = end - timedelta(days=30)
-    try:
-        async with httpx.AsyncClient(timeout=45) as c:
-            r = await c.get("https://power.larc.nasa.gov/api/temporal/daily/point",
-                params={"parameters": "PRECTOTCORR,T2M",
-                        "community": "AG",
-                        "longitude": lo, "latitude": la,
-                        "start": start.strftime("%Y%m%d"),
-                        "end": end.strftime("%Y%m%d"),
-                        "format": "JSON"})
-        d = r.json()
-        param = d.get("properties", {}).get("parameter", {})
-        rain = param.get("PRECTOTCORR", {})
-        temps = param.get("T2M", {})
-        rain_vals = [v for v in rain.values() if isinstance(v, (int, float))]
-        temp_vals = [v for v in temps.values() if isinstance(v, (int, float))]
-        return {"ok":True,"county":county.title(),
-                "rain_30d_mm": round(sum(rain_vals), 1) if rain_vals else 0,
-                "avg_temp_c": round(sum(temp_vals)/len(temp_vals), 1) if temp_vals else 0,
-                "days": len(rain_vals),
-                "source": "NASA POWER (LARC)"}
-    except Exception as e:
-        return {"ok":False,"error":str(e)}
-
-# ═══════════════════════════════════════════════════════════════
-# LIGHTNING — WMO thunderstorm codes from Open-Meteo
-# ═══════════════════════════════════════════════════════════════
-@app.get("/drought/{county}")
-async def drought(county: str):
-    p = DROUGHT_DATA.get(county.strip().lower())
-    if p is None: return {"ok":False,"error":f"No data for '{county}'"}
-    labels = {1:"Minimal",2:"Alert",3:"Alarm",4:"Emergency",5:"Famine"}
-    return {"ok":True,"county":county.title(),"phase":p,"label":labels[p]}
-
-@app.get("/ndvi/{county}")
-async def ndvi(county: str):
-    p = DROUGHT_DATA.get(county.strip().lower())
-    if p is None: return {"ok":False,"error":f"No data for '{county}'"}
-    vci_map = {1:55,2:40,3:25,4:15,5:5}
-    vci = vci_map.get(p,40)
-    if vci>=50: s = "Wet — vegetation healthy"
-    elif vci>=35: s = "Normal — no drought stress"
-    elif vci>=21: s = "Moderate drought — stress visible"
-    elif vci>=10: s = "Severe drought — significant loss"
-    else: s = "Extreme — vegetation collapse"
-    labels = {1:"Minimal",2:"Alert",3:"Alarm",4:"Emergency",5:"Famine"}
-    return {"ok":True,"county":county.title(),"vci":vci,"status":s,
-            "drought_phase":p,"drought_label":labels[p],
-            "ndvi_explanation":"NDVI measures how green vegetation is from satellite. 0.1=bare ground, 0.2-0.3=grassland, 0.5+=forest.",
-            "vci_explanation":"VCI compares today's NDVI vs historical min/max. Below 35 triggers Kenya's drought early warning.",
-            "thresholds":{"wet":"VCI>=50","normal":"35-50","moderate":"21-34","severe":"10-20","extreme":"<=10"}}
-
-# ═══════════════════════════════════════════════════════════════
-# FIRES
-# ═══════════════════════════════════════════════════════════════
-@app.get("/fires/kenya")
-async def fires():
-    urls = ["https://firms.modaps.eosdis.nasa.gov/data/active_fire/suomi-npp-viirs-c2/csv/SUOMI_VIIRS_C2_Global_24h.csv",
-            "https://firms.modaps.eosdis.nasa.gov/data/active_fire/modis-c6.1/csv/MODIS_C6_1_Global_24h.csv"]
-    fires = []
-    async with httpx.AsyncClient(timeout=45) as c:
-        for url in urls:
-            try:
-                r = await c.get(url)
-                if r.status_code >= 300: continue
-                lines = r.text.strip().split("\n")
-                if not lines: continue
-                hdr = lines[0].split(",")
-                for line in lines[1:]:
-                    parts = line.split(",")
-                    if len(parts) < len(hdr): continue
-                    row = dict(zip(hdr, parts))
-                    try: la=float(row.get("latitude",0)); lo=float(row.get("longitude",0))
-                    except: continue
-                    if -5<=la<=6 and 33<=lo<=42:
-                        fires.append({"lat":la,"lon":lo,"county":nearest_county(la,lo) or "Unknown",
-                                      "brightness":row.get("bright_ti4") or row.get("brightness"),
-                                      "confidence":row.get("confidence"),
-                                      "date":row.get("acq_date"),"time":row.get("acq_time"),
-                                      "satellite":row.get("satellite")})
-            except Exception: continue
-    return {"ok":True,"count":len(fires),"fires":fires[:100]}
-
-# ═══════════════════════════════════════════════════════════════
-# NEWS
-# ═══════════════════════════════════════════════════════════════
-@app.get("/news/kenya")
-async def news(limit: int = 10):
-    try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get("https://www.standardmedia.co.ke/rss/headlines.php",
-                            headers={"User-Agent":"Imhotep/1.0"})
-        root = ET.fromstring(r.text)
-        items = []
-        for item in root.findall(".//item")[:limit]:
-            items.append({"title":(item.findtext("title") or "").strip(),
-                          "link":(item.findtext("link") or "").strip()})
-        return {"ok":True,"count":len(items),"items":items}
-    except Exception as e: raise HTTPException(502, str(e))
-
-# ═══════════════════════════════════════════════════════════════
-# CLIMATE
-# ═══════════════════════════════════════════════════════════════
-@app.get("/climate/kenya")
-async def climate():
-    lat, lon = -1.2921, 36.8219
-    try:
-        async with httpx.AsyncClient(timeout=90) as c:
-            r1 = await c.get("https://archive-api.open-meteo.com/v1/archive",
-                params={"latitude":lat,"longitude":lon,"start_date":"1985-01-01",
-                        "end_date":"2014-12-31","daily":"temperature_2m_max",
-                        "timezone":"Africa/Nairobi"})
-            h = r1.json()
-            r2 = await c.get("https://climate-api.open-meteo.com/v1/climate",
-                params={"latitude":lat,"longitude":lon,"start_date":"2025-01-01",
-                        "end_date":"2050-12-31","models":"MRI_AGCM3_2_S",
-                        "daily":"temperature_2m_max"})
-            p = r2.json()
-    except Exception as e: raise HTTPException(502, str(e))
-    def avg(arr):
-        v = [x for x in (arr or []) if isinstance(x,(int,float))]
-        return round(sum(v)/len(v),2) if v else None
-    ht = avg(h.get("daily",{}).get("temperature_2m_max",[]))
-    pt = avg(p.get("daily",{}).get("temperature_2m_max",[]))
-    dt = round(pt-ht,2) if (ht and pt) else None
-    return {"ok":True,"historical":{"period":"1985-2014","avg_tmax_c":ht},
-            "projection":{"period":"2025-2050","avg_tmax_c":pt},
-            "change":{"warming_c":dt,
-                      "verdict":("Kenya is warming — prepare for heat stress" if dt and dt>0.5
-                                 else "Stable" if dt and abs(dt)<=0.5 else "Cooling")}}
-
-# ═══════════════════════════════════════════════════════════════
-# NASA + SATELLITE
-# ═══════════════════════════════════════════════════════════════
-@app.get("/nasa/earth")
-async def nasa_earth():
-    async with httpx.AsyncClient(timeout=20) as c:
-        r = await c.get("https://epic.gsfc.nasa.gov/api/natural")
-    items = r.json()
-    if not items: raise HTTPException(404, "No images")
-    latest = items[0]
-    dp = latest["date"].split(" ")[0].replace("-","/")
-    return {"ok":True,"date":latest["date"],
-            "image_url":f"https://epic.gsfc.nasa.gov/archive/natural/{dp}/png/{latest['image']}.png"}
-
-@app.get("/img/proxy")
-async def proxy(url: str):
-    ALLOWED = ("epic.gsfc.nasa.gov","cdn.star.nesdis.noaa.gov","gibs.earthdata.nasa.gov","images-api.nasa.gov")
-    from urllib.parse import urlparse
-    host = urlparse(url).netloc
-    if not any(host.endswith(d) for d in ALLOWED): raise HTTPException(403,"Domain not allowed")
-    async with httpx.AsyncClient(timeout=45) as c:
-        r = await c.get(url, headers={"User-Agent":"Imhotep/1.0"})
-    if r.status_code >= 300: raise HTTPException(r.status_code,"Upstream failed")
-    return StreamingResponse(iter([r.content]),
-        media_type=r.headers.get("content-type","image/jpeg"),
-        headers={"Cache-Control":"public, max-age=600","Access-Control-Allow-Origin":"*"})
-
-@app.post("/satellite/analyze")
-async def sat_analyze(body: dict):
-    lat = body.get("lat"); lon = body.get("lon")
-    if lat is None or lon is None: raise HTTPException(400,"Need lat/lon")
-    county = nearest_county(lat, lon) or "Unknown"
-    weather_text = "unavailable"
-    try:
-        async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get("https://api.open-meteo.com/v1/forecast",
-                params={"latitude":lat,"longitude":lon,
-                        "current":"temperature_2m,weather_code","timezone":"Africa/Nairobi"})
-        cur = (r.json().get("current") or {})
-        t = round(cur.get("temperature_2m",0)); cls = classify_wx(t, cur.get("weather_code",0))
-        weather_text = f"{t}°C, {cls['condition_label']}"
-    except Exception: pass
-    phase = DROUGHT_DATA.get(county.lower())
-    drought_text = {1:"Minimal",2:"Alert",3:"Alarm",4:"Emergency",5:"Famine"}[phase] if phase else "no data"
-    fire_count = 0
-    try:
-        async with httpx.AsyncClient(timeout=45) as c:
-            r = await c.get("https://firms.modaps.eosdis.nasa.gov/data/active_fire/suomi-npp-viirs-c2/csv/SUOMI_VIIRS_C2_Global_24h.csv")
-        if r.status_code == 200:
-            for line in r.text.strip().split("\n")[1:]:
-                parts = line.split(",")
-                if len(parts) < 2: continue
-                try: la=float(parts[0]); lo=float(parts[1])
-                except: continue
-                if abs(la-lat) < 0.5 and abs(lo-lon) < 0.5: fire_count += 1
-    except Exception: pass
-    prompt = (f"You are Imhotep, built by Samuel Kiragu in Mukuyu, Murang'a, Kenya. "
-              f"Talk to a user looking at satellite data of {county} County. "
-              f"Weather: {weather_text}. Drought: {drought_text}. Fires nearby: {fire_count}. "
-              f"Answer directly in 3-4 sentences — what this means for people of {county}. "
-              f"Do NOT output thinking or reasoning steps. Just give the answer.")
-    try:
-        raw = await nvidia_call([{"role":"user","content":prompt}], 0.6)
-    except Exception:
-        raw = f"{county} County: {weather_text}. Drought: {drought_text}. Fires: {fire_count}."
-    return {"ok":True,"county":county,"lat":lat,"lon":lon,"weather":weather_text,
-            "drought":drought_text,"fire_count":fire_count,"analysis":raw}
-
-# ═══════════════════════════════════════════════════════════════
-# CHAT
-# ═══════════════════════════════════════════════════════════════
 @app.post("/chat")
 async def chat(b: ChatIn):
     p = b.prompt.strip()
@@ -755,20 +574,19 @@ async def chat(b: ChatIn):
         "upgrade_url":"https://kiragu2004.github.io/imhotep-site/auth.html"})
     if not debit(u):
         c = creds(u)
-        raise HTTPException(402, detail={"error":"No credits left. Upgrade.",
+        raise HTTPException(402, detail={"error":"No credits left.",
             "used":c["used"],"limit":c["limit"],
             "upgrade_url":"https://kiragu2004.github.io/imhotep-site/pricing.html"})
-    agent = b.agent or "generalist"
-    if is_sheng(p): agent = "sheng"
+    a = b.agent or "generalist"
+    if is_sheng(p): a = "sheng"
     t = max(0.0, min(2.0, b.temperature))
-    msgs = [{"role":"system","content":sys_prompt(agent,p)},
-            {"role":"user","content":p}]
-    raw = scrub(await call_model(msgs, t))
-    raw = strip_thinking(raw)  # Double strip to be safe
+    raw = scrub(await call_model([{"role":"system","content":sys_prompt(a,p)},
+                                  {"role":"user","content":p}], t))
+    raw = strip_thinking(raw)
     if u in chat_db:
-        chat_db[u].append({"prompt":p,"reply":raw,"agent":agent,
+        chat_db[u].append({"prompt":p,"reply":raw,"agent":a,
                            "timestamp":datetime.now(timezone.utc).isoformat()})
-    return {"ok":True,"reply":raw,"agent":agent,"credits":creds(u)}
+    return {"ok":True,"reply":raw,"agent":a,"credits":creds(u)}
 
 @app.get("/chat/history")
 async def hist(user_id: Optional[str] = None):
@@ -785,34 +603,30 @@ async def debate(b: DebateIn):
     p = b.proposition.strip()
     if not p: raise HTTPException(400,"Proposition required")
     ag = b.agents or ["scientist","economist"]
-    pa, ca = ag[0], ag[1]
-    pro = scrub(await call_model([{"role":"system","content":sys_prompt(pa,p)+" Argue FOR."},
+    pro = scrub(await call_model([{"role":"system","content":sys_prompt(ag[0],p)+" Argue FOR."},
         {"role":"user","content":f"{p} — 150 words FOR."}], 0.7))
-    con = scrub(await call_model([{"role":"system","content":sys_prompt(ca,p)+" Argue AGAINST."},
+    con = scrub(await call_model([{"role":"system","content":sys_prompt(ag[1],p)+" Argue AGAINST."},
         {"role":"user","content":f"{p} — 150 words AGAINST."}], 0.7))
     j = scrub(await call_model([{"role":"system","content":"You are a judge."},
         {"role":"user","content":f"Judge: {p}\nPRO: {pro[:300]}\nCON: {con[:300]}"}], 0.4))
     return {"ok":True,"proposition":p,"proponent":pro,"opponent":con,"judge":j}
 
-# ═══════════════════════════════════════════════════════════════
-# PRICING
-# ═══════════════════════════════════════════════════════════════
 @app.get("/pricing")
 async def pricing(): return {"ok":True,"currency":"KES","tiers":PRICES}
 
 @app.post("/checkout")
 async def checkout(b: CheckoutIn):
-    tier = TIER_ALIAS.get(b.tier, b.tier)
-    if tier not in PRICES: raise HTTPException(400,"Unknown tier")
-    t = PRICES[tier]
-    ref = f"IMH-{tier}-{int(time.time())}-{secrets.token_hex(3)}"
+    t = TALIAS.get(b.tier, b.tier)
+    if t not in PRICES: raise HTTPException(400,"Unknown tier")
+    info = PRICES[t]
+    ref = f"IMH-{t}-{int(time.time())}-{secrets.token_hex(3)}"
     url = None
     if NESTLINK_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=30) as c:
                 r = await c.post("https://api.nestlink.co.ke/v1/checkout",
-                    json={"amount":t["amount"],"currency":"KES","email":b.email,
-                          "narrative":t["label"],"reference":ref},
+                    json={"amount":info["amount"],"currency":"KES","email":b.email,
+                          "narrative":info["label"],"reference":ref},
                     headers={"Authorization":f"Bearer {NESTLINK_API_KEY}"})
             if r.status_code < 300:
                 d = r.json()
@@ -820,52 +634,15 @@ async def checkout(b: CheckoutIn):
         except Exception: pass
     if not url:
         url = f"https://me.nestlink.co.ke/Imhotepagenticai?email={b.email}&reference={ref}"
-    return {"ok":True,"tier":tier,"amount":t["amount"],"payment_url":url,"reference":ref}
-
-@app.post("/nestlink/webhook")
-async def webhook(request: Request):
-    raw = await request.body()
-    try:
-        with open(WEBHOOK_LOG, "a") as f:
-            f.write(json.dumps({"ts":time.time(),"body":raw.decode("utf-8","ignore")[:2000]}) + "\n")
-    except: pass
-    try: payload = json.loads(raw.decode())
-    except: payload = {}
-    def find(p, keys):
-        if not isinstance(p, dict): return None
-        for k in keys:
-            if p.get(k): return p[k]
-        for v in p.values():
-            if isinstance(v, dict):
-                r = find(v, keys)
-                if r: return r
-        return None
-    email = find(payload, ("email","customer_email"))
-    ref = find(payload, ("reference","api_ref","ref"))
-    if not email or not ref: return {"ok":True,"upgraded":False}
-    parts = str(ref).split("-")
-    tier = None
-    for i in range(1, len(parts)+1):
-        cand = "-".join(parts[1:i])
-        if cand in TIER_CREDITS: tier = cand; break
-    if not tier: return {"ok":True,"upgraded":False}
-    for uid, u in users_db.items():
-        if u["email"].lower() == email.lower():
-            u["credits"] += TIER_CREDITS[tier]; u["tier"] = tier; u["credits_used"] = 0
-            return {"ok":True,"upgraded":True,"email":email,"tier":tier}
-    uid, _ = mk_user(email.lower(), email.split("@")[0], tier)
-    users_db[uid]["credits"] = TIER_CREDITS[tier]
-    return {"ok":True,"upgraded":True,"created":True}
+    return {"ok":True,"tier":t,"amount":info["amount"],"payment_url":url,"reference":ref}
 
 @app.get("/health")
 async def health():
-    return {"ok":True,"version":"10.0.0",
+    return {"ok":True,"version":"12.0.0",
             "model_configured":bool(NVIDIA_API_KEY),
             "nestlink_configured":bool(NESTLINK_API_KEY),
-            "counties":len(KENYA_COUNTIES_FULL),
-            "endpoints":["/weather/all-counties","/heatmap/rain","/flood/{county}",
-                         "/disasters","/lightning","/nasa/power/{county}",
-                         "/ndvi/{county}","/fires/kenya","/news/kenya","/climate/kenya"]}
+            "counties":len(KENYA),
+            "cache_keys":len(_CACHE)}
 
 if __name__ == "__main__":
     import uvicorn
