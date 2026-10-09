@@ -306,65 +306,68 @@ async def weather_ep(body: dict):
 
 @app.get("/weather/all-counties")
 async def weather_all():
-    """Weather for all 47 counties — 4 concurrent max."""
+    """All 47 counties in ONE multi-location request."""
     names = list(KENYA_COUNTIES_FULL.keys())
     coords = list(KENYA_COUNTIES_FULL.values())
-    sem = asyncio.Semaphore(4)
-
-    async def one(name, lat, lon):
-        async with sem:
-            try:
-                async with httpx.AsyncClient(timeout=15) as c:
-                    r = await c.get("https://api.open-meteo.com/v1/forecast",
-                        params={"latitude": f"{lat:.4f}", "longitude": f"{lon:.4f}",
-                                "current": "temperature_2m,weather_code",
-                                "timezone": "Africa/Nairobi"})
-                cur = (r.json().get("current") or {})
-                if cur.get("temperature_2m") is None: return None
-                t = round(cur["temperature_2m"])
-                cls = classify_wx(t, cur.get("weather_code", 0))
-                return {"county": name, "temp": t, **cls}
-            except Exception as e:
-                print(f"{name}: {e}")
-                return None
-
-    done = await asyncio.gather(*[one(n, la, lo) for n, (la, lo) in zip(names, coords)])
-    results = [r for r in done if r]
-    return {"ok": True, "count": len(results), "counties": results}
-
+    lats = ",".join(f"{la:.4f}" for la, lo in coords)
+    lons = ",".join(f"{lo:.4f}" for la, lo in coords)
+    try:
+        async with httpx.AsyncClient(timeout=25) as c:
+            r = await c.get("https://api.open-meteo.com/v1/forecast",
+                params={"latitude": lats, "longitude": lons,
+                        "current": "temperature_2m,weather_code",
+                        "timezone": "Africa/Nairobi"})
+        data = r.json()
+        items = data if isinstance(data, list) else [data]
+        results = []
+        for j, item in enumerate(items):
+            if j >= len(names): break
+            cur = item.get("current") or {}
+            if cur.get("temperature_2m") is None: continue
+            t = round(cur["temperature_2m"])
+            cls = classify_wx(t, cur.get("weather_code", 0))
+            results.append({"county": names[j], "temp": t, **cls})
+        return {"ok": True, "count": len(results), "counties": results}
+    except Exception as e:
+        print(f"weather_all error: {e}")
+        return {"ok": False, "count": 0, "counties": [], "error": str(e)}
 
 @app.get("/heatmap/rain")
 async def heatmap_rain():
-    """Return a 6x6 grid of Kenya with 3-day rain predictions."""
+    """36-cell rain grid in ONE multi-location request."""
     lat_min, lat_max = -4.7, 5.0
     lon_min, lon_max = 33.9, 41.9
     N = 6
-    results = []
-    async with httpx.AsyncClient(timeout=25) as c:
-        for i in range(N):
-            for j in range(N):
-                la = lat_min + (lat_max - lat_min) * i / (N - 1)
-                lo = lon_min + (lon_max - lon_min) * j / (N - 1)
-                try:
-                    r = await c.get("https://api.open-meteo.com/v1/forecast",
-                        params={"latitude": f"{la:.3f}", "longitude": f"{lo:.3f}",
-                                "daily": "precipitation_sum", "forecast_days": 3,
-                                "timezone": "Africa/Nairobi"})
-                    d = r.json()
-                    daily = d.get("daily", {}).get("precipitation_sum", [0,0,0])
-                    total = sum(v for v in daily if v is not None)
-                    results.append({
-                        "lat": round(la, 2), "lon": round(lo, 2),
+    cells = []
+    for i in range(N):
+        for j in range(N):
+            la = lat_min + (lat_max - lat_min) * i / (N - 1)
+            lo = lon_min + (lon_max - lon_min) * j / (N - 1)
+            cells.append((la, lo))
+    lats = ",".join(f"{la:.3f}" for la, lo in cells)
+    lons = ",".join(f"{lo:.3f}" for la, lo in cells)
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.get("https://api.open-meteo.com/v1/forecast",
+                params={"latitude": lats, "longitude": lons,
+                        "daily": "precipitation_sum", "forecast_days": 3,
+                        "timezone": "Africa/Nairobi"})
+        data = r.json()
+        items = data if isinstance(data, list) else [data]
+        out = []
+        for k, item in enumerate(items):
+            if k >= len(cells): break
+            la, lo = cells[k]
+            daily = item.get("daily", {}).get("precipitation_sum", [])
+            total = sum(v for v in daily if v is not None) if daily else 0
+            out.append({"lat": round(la, 2), "lon": round(lo, 2),
                         "rain_mm": round(total, 1),
-                        "county": nearest_county(la, lo) or "",
-                    })
-                    await asyncio.sleep(0.15)
-                except Exception: continue
-    return {"ok":True,"grid_size":N,"cells":results}
+                        "county": nearest_county(la, lo) or ""})
+        return {"ok": True, "grid_size": N, "cells": out}
+    except Exception as e:
+        print(f"heatmap error: {e}")
+        return {"ok": False, "grid_size": N, "cells": [], "error": str(e)}
 
-# ═══════════════════════════════════════════════════════════════
-# FLOOD FORECAST — Open-Meteo Flood API (free, no key)
-# ═══════════════════════════════════════════════════════════════
 @app.get("/flood/{county}")
 async def flood(county: str):
     """River discharge forecast for a Kenyan county. Open-Meteo Flood API."""
@@ -479,42 +482,33 @@ async def nasa_power(county: str):
 # ═══════════════════════════════════════════════════════════════
 @app.get("/lightning")
 async def lightning():
-    """Detect thunderstorm activity across Kenyan counties via WMO codes 95, 96, 99."""
+    """Thunderstorm detection in ONE multi-location request."""
     names = list(KENYA_COUNTIES_FULL.keys())
     coords = list(KENYA_COUNTIES_FULL.values())
-    storms = []
-    async with httpx.AsyncClient(timeout=20) as c:
-        for i in range(0, len(coords), 12):
-            batch_names = names[i:i+12]
-            batch_coords = coords[i:i+12]
-            lats = ",".join(f"{la:.4f}" for la, lo in batch_coords)
-            lons = ",".join(f"{lo:.4f}" for la, lo in batch_coords)
-            try:
-                r = await c.get("https://api.open-meteo.com/v1/forecast",
-                    params={"latitude": lats, "longitude": lons,
-                            "current": "weather_code,temperature_2m",
-                            "timezone": "Africa/Nairobi"})
-                data = r.json()
-                items = data if isinstance(data, list) else [data]
-                for j, item in enumerate(items):
-                    if j >= len(batch_names): break
-                    cur = item.get("current") or {}
-                    code = cur.get("weather_code", 0)
-                    if code in (95, 96, 99):
-                        storms.append({
-                            "county": batch_names[j],
-                            "code": code,
-                            "temp": round(cur.get("temperature_2m", 0)),
-                            "severity": "Heavy" if code == 99 else "Moderate" if code == 96 else "Thunderstorm",
-                        })
-                await asyncio.sleep(0.5)
-            except Exception: continue
-    return {"ok":True,"count":len(storms),"storms":storms,
-            "note":"WMO codes 95/96/99 = thunderstorm/lightning detected"}
+    lats = ",".join(f"{la:.4f}" for la, lo in coords)
+    lons = ",".join(f"{lo:.4f}" for la, lo in coords)
+    try:
+        async with httpx.AsyncClient(timeout=25) as c:
+            r = await c.get("https://api.open-meteo.com/v1/forecast",
+                params={"latitude": lats, "longitude": lons,
+                        "current": "weather_code,temperature_2m",
+                        "timezone": "Africa/Nairobi"})
+        data = r.json()
+        items = data if isinstance(data, list) else [data]
+        storms = []
+        for j, item in enumerate(items):
+            if j >= len(names): break
+            cur = item.get("current") or {}
+            code = cur.get("weather_code", 0)
+            if code in (95, 96, 99):
+                storms.append({"county": names[j], "code": code,
+                               "temp": round(cur.get("temperature_2m", 0)),
+                               "severity": "Heavy" if code == 99 else "Moderate" if code == 96 else "Thunderstorm"})
+        return {"ok": True, "count": len(storms), "storms": storms}
+    except Exception as e:
+        print(f"lightning error: {e}")
+        return {"ok": False, "count": 0, "storms": [], "error": str(e)}
 
-# ═══════════════════════════════════════════════════════════════
-# NDVI / DROUGHT
-# ═══════════════════════════════════════════════════════════════
 @app.get("/drought/{county}")
 async def drought(county: str):
     p = DROUGHT_DATA.get(county.strip().lower())
