@@ -175,16 +175,15 @@ def debit(u):
     users_db[u]["credits_used"] = users_db[u].get("credits_used",0) + 1
     return True
 
-# ═══════════════════════════════════════════════════════════════
-# WEATHER — SINGLE county per request (no batches)
-# ═══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+# NEW: single-county weather routes (only additions in v13)
+# ══════════════════════════════════════════════════════════════════
 @app.get("/counties")
 async def counties():
     return {"ok": True, "counties": list(KENYA.keys())}
 
 @app.get("/weather/county/{name}")
 async def weather_county(name: str):
-    """Weather for ONE county. Cached 5 min."""
     ck = f"wx_{name}"
     c = cget(ck, 300)
     if c: return c
@@ -211,12 +210,11 @@ async def weather_county(name: str):
 
 @app.get("/weather/forecast/{name}")
 async def weather_forecast(name: str):
-    """7-day forecast for one county."""
     ck = f"fc_{name}"
     c = cget(ck, 1800)
     if c: return c
     key = next((k for k in KENYA if k.lower() == name.lower()), None)
-    if not key: raise HTTPException(404, f"Unknown county")
+    if not key: raise HTTPException(404, "Unknown county")
     la, lo = KENYA[key]
     try:
         async with httpx.AsyncClient(timeout=12) as c:
@@ -226,10 +224,8 @@ async def weather_forecast(name: str):
                         "forecast_days": 7,
                         "timezone": "Africa/Nairobi"})
         d = r.json().get("daily", {})
-        dates = d.get("time", [])
-        tmax = d.get("temperature_2m_max", [])
-        tmin = d.get("temperature_2m_min", [])
-        rain = d.get("precipitation_sum", [])
+        dates = d.get("time", []); tmax = d.get("temperature_2m_max", [])
+        tmin = d.get("temperature_2m_min", []); rain = d.get("precipitation_sum", [])
         codes = d.get("weather_code", [])
         days = []
         for i in range(min(7, len(dates))):
@@ -238,15 +234,14 @@ async def weather_forecast(name: str):
                          "tmax": round(tmax[i]) if tmax[i] is not None else None,
                          "tmin": round(tmin[i]) if tmin[i] is not None else None,
                          "rain_mm": round(rain[i], 1) if i < len(rain) and rain[i] is not None else 0,
-                         "emoji": cls["emoji"],
-                         "condition": cls["condition_label"]})
+                         "emoji": cls["emoji"], "condition": cls["condition_label"]})
         result = {"ok": True, "county": key, "days": days}
         cset(ck, result)
         return result
     except Exception as e:
         raise HTTPException(502, str(e))
 
-# ── Legacy: single-weather POST (kept for chat.html) ──
+# ── Legacy single weather POST (kept — chat.html and GPS still use it) ──
 @app.post("/weather")
 async def weather_ep(b: dict):
     lat, lon, city = b.get("lat"), b.get("lon"), b.get("city")
@@ -255,7 +250,6 @@ async def weather_ep(b: dict):
     if lat is None or lon is None: raise HTTPException(400, "Need lat/lon or city")
     if city:
         return await weather_county(city)
-    # lat/lon path
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get("https://api.open-meteo.com/v1/forecast",
@@ -270,7 +264,7 @@ async def weather_ep(b: dict):
     except Exception as e:
         raise HTTPException(502, str(e))
 
-# ── Fires ──
+# ── Fires (UNCHANGED) ──
 @app.get("/fires/kenya")
 async def fires():
     ck = "fires"
@@ -305,7 +299,7 @@ async def fires():
     cset(ck, result)
     return result
 
-# ── Drought / NDVI ──
+# ── Drought / NDVI (UNCHANGED) ──
 @app.get("/drought/{county}")
 async def drought(county: str):
     p = DROUGHT.get(county.strip().lower())
@@ -323,7 +317,7 @@ async def ndvi(county: str):
             "ndvi_explanation":"NDVI = vegetation greenness from satellite.",
             "vci_explanation":"VCI = today vs historical. Below 35 = early warning."}
 
-# ── Flood ──
+# ── Flood (UNCHANGED) ──
 @app.get("/flood/{county}")
 async def flood(county: str):
     k = county.strip().lower()
@@ -348,7 +342,7 @@ async def flood(county: str):
     except Exception as e:
         return {"ok":False,"error":str(e)}
 
-# ── Disasters ──
+# ── Disasters (UNCHANGED) ──
 @app.get("/disasters")
 async def disasters():
     try:
@@ -367,7 +361,7 @@ async def disasters():
     except Exception as e:
         return {"ok":False,"error":str(e)}
 
-# ── NASA POWER ──
+# ── NASA POWER (UNCHANGED) ──
 @app.get("/nasa/power/{county}")
 async def nasa_power(county: str):
     k = county.strip().lower()
@@ -393,7 +387,7 @@ async def nasa_power(county: str):
     except Exception as e:
         return {"ok":False,"error":str(e)}
 
-# ── News ──
+# ── News (UNCHANGED) ──
 @app.get("/news/kenya")
 async def news(limit: int = 10):
     try:
@@ -407,7 +401,7 @@ async def news(limit: int = 10):
         return {"ok":True,"count":len(items),"items":items}
     except Exception as e: raise HTTPException(502, str(e))
 
-# ── Climate ──
+# ── Climate (UNCHANGED — this is what you saw working) ──
 @app.get("/climate/kenya")
 async def climate():
     c = cget("climate", 3600)
@@ -440,7 +434,7 @@ async def climate():
     cset("climate", result)
     return result
 
-# ── NASA Earth ──
+# ── NASA Earth + proxy (UNCHANGED) ──
 @app.get("/nasa/earth")
 async def earth():
     async with httpx.AsyncClient(timeout=20) as c:
@@ -485,7 +479,7 @@ async def call_model(msgs, temp):
         except Exception as e: print(f"nvidia: {e}")
     return "I'm Imhotep, built by Samuel Kiragu in Mukuyu, Murang'a, Kenya."
 
-# ── Chat ──
+# ── Chat + Auth (UNCHANGED) ──
 @app.get("/agents")
 async def agents(): return {"ok":True,"agents":list(PERSONAS.keys())}
 
