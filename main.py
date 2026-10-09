@@ -286,51 +286,34 @@ async def weather_ep(body: dict):
 
 @app.get("/weather/all-counties")
 async def weather_all_counties():
-    """Weather for all 47 counties via Open-Meteo, chunked."""
-    results = []
+    """Weather for all 47 counties — parallel requests."""
+    import asyncio
     names = list(KENYA_COUNTIES_FULL.keys())
     coords = list(KENYA_COUNTIES_FULL.values())
-    CHUNK = 15
 
-    async with httpx.AsyncClient(timeout=45) as c:
-        for start in range(0, len(coords), CHUNK):
-            chunk = coords[start:start + CHUNK]
-            chunk_names = names[start:start + CHUNK]
-            lats = ",".join(str(v[0]) for v in chunk)
-            lons = ",".join(str(v[1]) for v in chunk)
-            try:
+    async def _fetch_one(name, lat, lon):
+        try:
+            async with httpx.AsyncClient(timeout=12) as c:
                 r = await c.get("https://api.open-meteo.com/v1/forecast",
-                    params={"latitude": lats, "longitude": lons,
+                    params={"latitude": lat, "longitude": lon,
                             "current": "temperature_2m,weather_code",
                             "timezone": "Africa/Nairobi"})
-                data = r.json()
-                items = data if isinstance(data, list) else [data]
-                for i, item in enumerate(items):
-                    if i >= len(chunk_names): break
-                    cur = item.get("current") or {}
-                    if cur.get("temperature_2m") is None: continue
-                    temp = round(cur["temperature_2m"])
-                    cls = classify_wx(temp, cur.get("weather_code", 0))
-                    results.append({"county": chunk_names[i], "temp": temp, **cls})
-            except Exception as e:
-                print(f"chunk {start}: {e}")
-                for j, (la, lo) in enumerate(chunk):
-                    try:
-                        r = await c.get("https://api.open-meteo.com/v1/forecast",
-                            params={"latitude": la, "longitude": lo,
-                                    "current": "temperature_2m,weather_code",
-                                    "timezone": "Africa/Nairobi"})
-                        cur = (r.json().get("current") or {})
-                        if cur.get("temperature_2m") is not None:
-                            temp = round(cur["temperature_2m"])
-                            cls = classify_wx(temp, cur.get("weather_code", 0))
-                            results.append({"county": chunk_names[j], "temp": temp, **cls})
-                    except Exception: continue
-    return {"ok": True, "count": len(results), "counties": results, "source": "open-meteo.com"}
+            cur = (r.json().get("current") or {})
+            if cur.get("temperature_2m") is None:
+                return None
+            temp = round(cur["temperature_2m"])
+            cls = classify_wx(temp, cur.get("weather_code", 0))
+            return {"county": name, "temp": temp, **cls}
+        except Exception as e:
+            print(f"{name}: {e}")
+            return None
 
-# ═══════════════════════════════════════════════════════════════
-# CLIMATE CHANGE
-# ═══════════════════════════════════════════════════════════════
+    tasks = [_fetch_one(n, la, lo) for n, (la, lo) in zip(names, coords)]
+    done = await asyncio.gather(*tasks)
+    results = [r for r in done if r]
+    return {"ok": True, "count": len(results), "counties": results,
+            "source": "open-meteo.com"}
+
 @app.get("/climate/kenya")
 async def climate_kenya():
     lat, lon = -1.2921, 36.8219
