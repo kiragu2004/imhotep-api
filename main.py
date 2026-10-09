@@ -14,6 +14,7 @@ NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b"
 NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 OPENWEATHER_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 NESTLINK_API_KEY = os.getenv("NESTLINK_API_KEY", "")
+ADMIN_KEY = os.getenv("ADMIN_KEY", "12345678910111213141516")
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS","*").split(",") if o.strip()]
 
 app = FastAPI(title="Imhotep", version="13.0.0")
@@ -584,11 +585,81 @@ async def checkout(b: CheckoutIn):
 
 @app.get("/health")
 async def health():
-    return {"ok":True,"version":"13.0.0",
+    return {"ok":True,"version":"13.1.0",
             "model_configured":bool(NVIDIA_API_KEY),
             "nestlink_configured":bool(NESTLINK_API_KEY),
             "counties":len(KENYA),
             "cache_keys":len(_C)}
+
+
+
+# ═══════════════════════════════════════════════════════════
+# ADMIN (read-only, protected by ADMIN_KEY)
+# ═══════════════════════════════════════════════════════════
+def _require_admin(key: str):
+    if not ADMIN_KEY or key != ADMIN_KEY:
+        raise HTTPException(403, "Forbidden")
+
+@app.get("/admin/stats")
+async def admin_stats(key: str = ""):
+    _require_admin(key)
+    total_users = len(users_db)
+    total_chats = sum(len(v) for v in chat_db.values())
+    total_credits_used = sum(u.get("credits_used", 0) for u in users_db.values())
+    guests = sum(1 for u in users_db.values() if u.get("tier") == "guest")
+    paid   = sum(1 for u in users_db.values()
+                 if u.get("tier") in ("starter_10","starter_20","starter_50",
+                                       "weekly","monthly","yearly"))
+    agent_counts = {}
+    for chats in chat_db.values():
+        for c in chats:
+            a = c.get("agent", "unknown")
+            agent_counts[a] = agent_counts.get(a, 0) + 1
+    top_agents = sorted(agent_counts.items(), key=lambda x: -x[1])[:5]
+    return {
+        "ok": True,
+        "users_total": total_users,
+        "users_guest": guests,
+        "users_paid": paid,
+        "chats_total": total_chats,
+        "credits_used_total": total_credits_used,
+        "top_agents": [{"agent": a, "chats": n} for a, n in top_agents],
+        "cache_keys": len(_C),
+        "uptime_note": "in-memory: data resets on Render restart"
+    }
+
+@app.get("/admin/users")
+async def admin_users(key: str = "", limit: int = 200):
+    _require_admin(key)
+    rows = []
+    for uid, u in users_db.items():
+        rows.append({
+            "user_id": uid,
+            "email": u.get("email", ""),
+            "name": u.get("name", ""),
+            "tier": u.get("tier", ""),
+            "credits": u.get("credits", 0),
+            "credits_used": u.get("credits_used", 0),
+            "chats": len(chat_db.get(uid, [])),
+            "created_at": u.get("created_at", "")
+        })
+    rows.sort(key=lambda r: r["created_at"], reverse=True)
+    return {"ok": True, "count": len(rows), "users": rows[:limit]}
+
+@app.get("/admin/chats")
+async def admin_chats(key: str = "", user_id: str = "", limit: int = 50):
+    _require_admin(key)
+    out = []
+    if user_id:
+        for c in chat_db.get(user_id, [])[-limit:]:
+            out.append({**c, "user_id": user_id})
+    else:
+        for uid, chats in chat_db.items():
+            for c in chats[-5:]:
+                out.append({**c, "user_id": uid})
+        out.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+        out = out[:limit]
+    return {"ok": True, "count": len(out), "chats": out}
 
 if __name__ == "__main__":
     import uvicorn
