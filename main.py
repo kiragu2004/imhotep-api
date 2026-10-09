@@ -306,35 +306,59 @@ async def weather_ep(body: dict):
 
 @app.get("/weather/all-counties")
 async def weather_all():
-    """All 47 counties in ONE multi-location request."""
+    """All 47 counties — sequential batches of 10, 1 concurrent."""
     names = list(KENYA_COUNTIES_FULL.keys())
     coords = list(KENYA_COUNTIES_FULL.values())
-    lats = ",".join(f"{la:.4f}" for la, lo in coords)
-    lons = ",".join(f"{lo:.4f}" for la, lo in coords)
-    try:
-        async with httpx.AsyncClient(timeout=25) as c:
-            r = await c.get("https://api.open-meteo.com/v1/forecast",
-                params={"latitude": lats, "longitude": lons,
-                        "current": "temperature_2m,weather_code",
-                        "timezone": "Africa/Nairobi"})
-        data = r.json()
-        items = data if isinstance(data, list) else [data]
-        results = []
-        for j, item in enumerate(items):
-            if j >= len(names): break
-            cur = item.get("current") or {}
-            if cur.get("temperature_2m") is None: continue
-            t = round(cur["temperature_2m"])
-            cls = classify_wx(t, cur.get("weather_code", 0))
-            results.append({"county": names[j], "temp": t, **cls})
-        return {"ok": True, "count": len(results), "counties": results}
-    except Exception as e:
-        print(f"weather_all error: {e}")
-        return {"ok": False, "count": 0, "counties": [], "error": str(e)}
+    results = []
+    BATCH = 10
+
+    for i in range(0, len(coords), BATCH):
+        batch_names = names[i:i+BATCH]
+        batch_coords = coords[i:i+BATCH]
+        lats = ",".join(f"{la:.4f}" for la, lo in batch_coords)
+        lons = ",".join(f"{lo:.4f}" for la, lo in batch_coords)
+
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.get("https://api.open-meteo.com/v1/forecast",
+                    params={"latitude": lats, "longitude": lons,
+                            "current": "temperature_2m,weather_code",
+                            "timezone": "Africa/Nairobi"})
+            print(f"batch {i//BATCH}: status={r.status_code} len={len(r.text)}")
+
+            if r.status_code != 200:
+                print(f"  body: {r.text[:200]}")
+                continue
+
+            data = r.json()
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                if "error" in data or "reason" in data:
+                    print(f"  API error: {data}")
+                    continue
+                items = [data]
+            else:
+                continue
+
+            for j, item in enumerate(items):
+                if j >= len(batch_names): break
+                cur = item.get("current") or {}
+                if cur.get("temperature_2m") is None: continue
+                t = round(cur["temperature_2m"])
+                cls = classify_wx(t, cur.get("weather_code", 0))
+                results.append({"county": batch_names[j], "temp": t, **cls})
+            # Respect 1-concurrent limit — pause between batches
+            await asyncio.sleep(0.8)
+        except Exception as e:
+            print(f"batch {i//BATCH} exception: {e}")
+            continue
+    return {"ok": True, "count": len(results), "counties": results}
+
 
 @app.get("/heatmap/rain")
 async def heatmap_rain():
-    """36-cell rain grid in ONE multi-location request."""
+    """36-cell rain grid — sequential batches of 10."""
     lat_min, lat_max = -4.7, 5.0
     lon_min, lon_max = 33.9, 41.9
     N = 6
@@ -344,29 +368,94 @@ async def heatmap_rain():
             la = lat_min + (lat_max - lat_min) * i / (N - 1)
             lo = lon_min + (lon_max - lon_min) * j / (N - 1)
             cells.append((la, lo))
-    lats = ",".join(f"{la:.3f}" for la, lo in cells)
-    lons = ",".join(f"{lo:.3f}" for la, lo in cells)
+
+    out = []
+    BATCH = 10
+    for i in range(0, len(cells), BATCH):
+        chunk = cells[i:i+BATCH]
+        lats = ",".join(f"{la:.3f}" for la, lo in chunk)
+        lons = ",".join(f"{lo:.3f}" for la, lo in chunk)
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.get("https://api.open-meteo.com/v1/forecast",
+                    params={"latitude": lats, "longitude": lons,
+                            "daily": "precipitation_sum", "forecast_days": 3,
+                            "timezone": "Africa/Nairobi"})
+            if r.status_code != 200:
+                print(f"heatmap batch {i//BATCH} status {r.status_code}")
+                continue
+            data = r.json()
+            items = data if isinstance(data, list) else [data]
+            for k, item in enumerate(items):
+                if k >= len(chunk): break
+                la, lo = chunk[k]
+                daily = item.get("daily", {}).get("precipitation_sum", []) or []
+                total = sum(v for v in daily if v is not None)
+                out.append({"lat": round(la, 2), "lon": round(lo, 2),
+                            "rain_mm": round(total, 1),
+                            "county": nearest_county(la, lo) or ""})
+            await asyncio.sleep(0.8)
+        except Exception as e:
+            print(f"heatmap exception: {e}")
+            continue
+    return {"ok": True, "grid_size": N, "cells": out}
+
+
+@app.get("/lightning")
+async def lightning():
+    """Thunderstorms across Kenya — sequential batches of 10."""
+    names = list(KENYA_COUNTIES_FULL.keys())
+    coords = list(KENYA_COUNTIES_FULL.values())
+    storms = []
+    BATCH = 10
+    for i in range(0, len(coords), BATCH):
+        bn = names[i:i+BATCH]
+        bc = coords[i:i+BATCH]
+        lats = ",".join(f"{la:.4f}" for la, lo in bc)
+        lons = ",".join(f"{lo:.4f}" for la, lo in bc)
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.get("https://api.open-meteo.com/v1/forecast",
+                    params={"latitude": lats, "longitude": lons,
+                            "current": "weather_code,temperature_2m",
+                            "timezone": "Africa/Nairobi"})
+            if r.status_code != 200: continue
+            data = r.json()
+            items = data if isinstance(data, list) else [data]
+            for j, item in enumerate(items):
+                if j >= len(bn): break
+                cur = item.get("current") or {}
+                code = cur.get("weather_code", 0)
+                if code in (95, 96, 99):
+                    storms.append({"county": bn[j], "code": code,
+                                   "temp": round(cur.get("temperature_2m", 0)),
+                                   "severity": "Heavy" if code == 99 else "Moderate" if code == 96 else "Thunderstorm"})
+            await asyncio.sleep(0.8)
+        except Exception as e:
+            print(f"lightning batch {i//BATCH}: {e}")
+            continue
+    return {"ok": True, "count": len(storms), "storms": storms}
+
+
+@app.get("/debug/weather")
+async def debug_weather():
+    """Return RAW Open-Meteo response for first 5 counties — for debugging."""
+    names = list(KENYA_COUNTIES_FULL.keys())[:5]
+    coords = list(KENYA_COUNTIES_FULL.values())[:5]
+    lats = ",".join(f"{la:.4f}" for la, lo in coords)
+    lons = ",".join(f"{lo:.4f}" for la, lo in coords)
     try:
-        async with httpx.AsyncClient(timeout=30) as c:
+        async with httpx.AsyncClient(timeout=20) as c:
             r = await c.get("https://api.open-meteo.com/v1/forecast",
                 params={"latitude": lats, "longitude": lons,
-                        "daily": "precipitation_sum", "forecast_days": 3,
+                        "current": "temperature_2m,weather_code",
                         "timezone": "Africa/Nairobi"})
-        data = r.json()
-        items = data if isinstance(data, list) else [data]
-        out = []
-        for k, item in enumerate(items):
-            if k >= len(cells): break
-            la, lo = cells[k]
-            daily = item.get("daily", {}).get("precipitation_sum", [])
-            total = sum(v for v in daily if v is not None) if daily else 0
-            out.append({"lat": round(la, 2), "lon": round(lo, 2),
-                        "rain_mm": round(total, 1),
-                        "county": nearest_county(la, lo) or ""})
-        return {"ok": True, "grid_size": N, "cells": out}
+        return {"ok": True, "status": r.status_code,
+                "lats": lats, "lons": lons,
+                "response_preview": r.text[:1500]}
     except Exception as e:
-        print(f"heatmap error: {e}")
-        return {"ok": False, "grid_size": N, "cells": [], "error": str(e)}
+        return {"ok": False, "error": str(e), "lats": lats, "lons": lons}
+
 
 @app.get("/flood/{county}")
 async def flood(county: str):
@@ -480,35 +569,6 @@ async def nasa_power(county: str):
 # ═══════════════════════════════════════════════════════════════
 # LIGHTNING — WMO thunderstorm codes from Open-Meteo
 # ═══════════════════════════════════════════════════════════════
-@app.get("/lightning")
-async def lightning():
-    """Thunderstorm detection in ONE multi-location request."""
-    names = list(KENYA_COUNTIES_FULL.keys())
-    coords = list(KENYA_COUNTIES_FULL.values())
-    lats = ",".join(f"{la:.4f}" for la, lo in coords)
-    lons = ",".join(f"{lo:.4f}" for la, lo in coords)
-    try:
-        async with httpx.AsyncClient(timeout=25) as c:
-            r = await c.get("https://api.open-meteo.com/v1/forecast",
-                params={"latitude": lats, "longitude": lons,
-                        "current": "weather_code,temperature_2m",
-                        "timezone": "Africa/Nairobi"})
-        data = r.json()
-        items = data if isinstance(data, list) else [data]
-        storms = []
-        for j, item in enumerate(items):
-            if j >= len(names): break
-            cur = item.get("current") or {}
-            code = cur.get("weather_code", 0)
-            if code in (95, 96, 99):
-                storms.append({"county": names[j], "code": code,
-                               "temp": round(cur.get("temperature_2m", 0)),
-                               "severity": "Heavy" if code == 99 else "Moderate" if code == 96 else "Thunderstorm"})
-        return {"ok": True, "count": len(storms), "storms": storms}
-    except Exception as e:
-        print(f"lightning error: {e}")
-        return {"ok": False, "count": 0, "storms": [], "error": str(e)}
-
 @app.get("/drought/{county}")
 async def drought(county: str):
     p = DROUGHT_DATA.get(county.strip().lower())
